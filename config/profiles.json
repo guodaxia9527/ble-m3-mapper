@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "YouTube",
+      "package": "com.google.android.youtube",
+      "buttons": {
+        "UP": { "action": "seek", "seconds": -5 },
+        "DOWN": { "action": "seek", "seconds": 5 },
+        "LEFT": { "action": "seek", "seconds": -10 },
+        "RIGHT": { "action": "seek", "seconds": 10 },
+        "CENTER": { "action": "toggle" },
+        "PHOTO": { "action": "none" }
+      }
+    }
+  ]
+}
