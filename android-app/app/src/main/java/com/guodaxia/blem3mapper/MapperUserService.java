@@ -69,6 +69,7 @@ public final class MapperUserService extends IMapperService.Stub {
         volatile Process capture;
         volatile Process focusProcess;
         volatile String readerFailure;
+        long nextAutomationAttempt;
         Thread worker;
         Ownership ownership;
         long retryAfter;
@@ -253,8 +254,9 @@ public final class MapperUserService extends IMapperService.Stub {
     }
 
     private void work(Run run) {
+        MediaControl media = null;
         try {
-            MediaControl media = new MediaControl();
+            media = new MediaControl();
             log("手机端映射已启动；只在已配置的应用中接管遥控器");
             long nextFocus = 0;
             String capturePackage = "";
@@ -275,6 +277,16 @@ public final class MapperUserService extends IMapperService.Stub {
                         else status(run, "等待打开已配置的应用；遥控器保持原有操作");
                     } else {
                         run.profile = profile.name;
+                        if (needsTranscriptAutomation(profile) && !media.isTranscriptAutomationReady()
+                                && now >= run.nextAutomationAttempt) {
+                            run.nextAutomationAttempt = now + 5000;
+                            try {
+                                media.prepareTranscriptAutomation();
+                                log("YouTube 字幕快速控制已就绪");
+                            } catch (Exception error) {
+                                log("字幕快速控制暂不可用：" + errorMessage(error));
+                            }
+                        }
                         if (!desired.equals(capturePackage)) {
                             stopCapture(run);
                             capturePackage = desired;
@@ -338,9 +350,17 @@ public final class MapperUserService extends IMapperService.Stub {
             run.stopping = true;
             boolean captureStopped = stopCapture(run);
             terminate(run.focusProcess);
+            if (media != null) media.close();
             // No more capture can be started after this point. Keep exclusivity through cleanup.
             if (captureStopped && run.ownership != null) run.ownership.close();
         }
+    }
+
+    private static boolean needsTranscriptAutomation(ProfileConfig.Profile profile) {
+        for (ProfileConfig.Action action : profile.buttons.values()) {
+            if ("caption_previous".equals(action.kind) || "caption_next".equals(action.kind)) return true;
+        }
+        return false;
     }
 
     private void updateFocus(Run run, Focus focus) {
@@ -420,6 +440,10 @@ public final class MapperUserService extends IMapperService.Stub {
             String description;
             if ("seek".equals(action.kind)) {
                 description = (action.seconds < 0 ? "后退 " : "前进 ") + Math.abs(action.seconds) + " 秒";
+            } else if ("caption_previous".equals(action.kind)) {
+                description = "跳到上一条字幕 " + formatCaptionTime(result.optLong("targetPosition", -1));
+            } else if ("caption_next".equals(action.kind)) {
+                description = "跳到下一条字幕 " + formatCaptionTime(result.optLong("targetPosition", -1));
             } else if ("like".equals(action.kind)) {
                 description = result.optBoolean("alreadyLiked") ? "已经赞过，保持点赞"
                         : result.optBoolean("confirmed") ? "已点赞" : "已发送点赞，请在 YouTube 中确认";
@@ -469,6 +493,14 @@ public final class MapperUserService extends IMapperService.Stub {
             if (run.focusProcess == process) run.focusProcess = null;
         }
         return focus;
+    }
+
+    private static String formatCaptionTime(long positionMs) {
+        if (positionMs < 0) return "";
+        long totalSeconds = positionMs / 1000;
+        long minutes = totalSeconds / 60;
+        long seconds = totalSeconds % 60;
+        return String.format(Locale.ROOT, "%d:%02d", minutes, seconds);
     }
 
     private static void scanFocus(Process process, Focus focus) {

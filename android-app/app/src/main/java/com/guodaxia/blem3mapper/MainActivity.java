@@ -49,7 +49,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
     private static final int BACKGROUND = Color.rgb(245, 247, 252);
     private static final String[] BUTTON_KEYS = {"UP", "DOWN", "LEFT", "RIGHT", "CENTER", "PHOTO"};
     private static final String[] BUTTON_LABELS = {"上键", "下键", "左键", "右键", "中键", "第六键"};
-    private static final String[] ACTION_LABELS = {"后退", "前进", "播放 / 暂停", "点赞", "不执行"};
+    private static final String[] ACTION_LABELS = {"后退", "前进", "上一条字幕", "下一条字幕", "播放 / 暂停", "点赞", "不执行"};
     private static final String PREFS = "mapper";
     private static final String CONFIG_KEY = "profiles_json";
     private static final String LIKE_DEFAULT_MIGRATED = "like_default_migrated_v1";
@@ -430,14 +430,15 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             rendering = false;
             return;
         }
-        configHint.setText("第六键默认点赞；点赞目前先适配 YouTube。更改后点击保存。");
+        configHint.setText("字幕跳转仅支持 YouTube，需打开转写文稿。更改后点击保存。");
         JSONObject buttons = profiles.optJSONObject(profileIndex).optJSONObject("buttons");
         for (int i = 0; i < editors.length; i++) {
             JSONObject value = buttons == null ? null : buttons.optJSONObject(BUTTON_KEYS[i]);
             String action = value == null ? "none" : value.optString("action", "none");
             int seconds = value == null ? 5 : value.optInt("seconds", 5);
             int selection = "seek".equals(action) ? (seconds < 0 ? 0 : 1)
-                    : "toggle".equals(action) ? 2 : "like".equals(action) ? 3 : 4;
+                    : "caption_previous".equals(action) ? 2 : "caption_next".equals(action) ? 3
+                    : "toggle".equals(action) ? 4 : "like".equals(action) ? 5 : 6;
             editors[i].action.setSelection(selection);
             editors[i].seconds.setText(String.valueOf(Math.max(1, Math.abs(seconds))));
             editors[i].secondsGroup.setVisibility(selection < 2 ? View.VISIBLE : View.INVISIBLE);
@@ -466,7 +467,14 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
                     }
                     value.put("action", "seek");
                     value.put("seconds", action == 0 ? -seconds : seconds);
-                } else value.put("action", action == 2 ? "toggle" : action == 3 ? "like" : "none");
+                } else if (action == 2 || action == 3) {
+                    if (!"com.google.android.youtube".equals(
+                            profiles.optJSONObject(profileIndex).optString("package"))) {
+                        if (showErrors) toast("字幕行跳转目前仅支持 YouTube");
+                        return false;
+                    }
+                    value.put("action", action == 2 ? "caption_previous" : "caption_next");
+                } else value.put("action", action == 4 ? "toggle" : action == 5 ? "like" : "none");
                 buttons.put(BUTTON_KEYS[i], value);
             }
             profiles.getJSONObject(profileIndex).put("buttons", buttons);

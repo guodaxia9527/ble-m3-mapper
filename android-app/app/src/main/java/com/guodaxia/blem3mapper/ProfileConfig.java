@@ -73,6 +73,9 @@ final class ProfileConfig {
                     seconds = integer(mapping, "seconds");
                     if (seconds == 0 || seconds < -300 || seconds > 300)
                         throw new IllegalArgumentException("跳转时间应为前进或后退 1 至 300 秒");
+                } else if ("caption_previous".equals(kind) || "caption_next".equals(kind)) {
+                    if (!"com.google.android.youtube".equals(packageName))
+                        throw new IllegalArgumentException("字幕行跳转目前仅支持 YouTube");
                 } else if (!"toggle".equals(kind) && !"like".equals(kind) && !"none".equals(kind)) {
                     throw new IllegalArgumentException("暂不支持的按键操作：" + kind);
                 }
