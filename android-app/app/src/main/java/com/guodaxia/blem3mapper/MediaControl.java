@@ -1,6 +1,7 @@
 package com.guodaxia.blem3mapper;
 
 import android.annotation.SuppressLint;
+import android.accessibilityservice.AccessibilityServiceInfo;
 import android.content.Context;
 import android.graphics.Rect;
 import android.media.MediaMetadata;
@@ -24,37 +25,27 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /** Runs only inside the Shizuku user service, with the verified shell media identity. */
 final class MediaControl {
     private static final String YOUTUBE = "com.google.android.youtube";
-    private static final Pattern TRANSCRIPT_TIME = Pattern.compile(
-            "^(?:(\\d+)小时)?\\s*(?:(\\d+)分钟)?\\s*(?:(\\d+)秒钟)");
     private final MediaSessionManager manager;
     private HandlerThread automationLooper;
     private Object automation;
     private Method getAutomationRoot;
     private Method getAutomationWindows;
+    private Method clearAutomationCache;
     private Method disconnectAutomation;
 
     private static final class TranscriptRow {
         final long timeMs;
-        final Rect bounds;
-        TranscriptRow(long timeMs, Rect bounds) {
-            this.timeMs = timeMs;
-            this.bounds = new Rect(bounds);
-        }
-        long area() { return (long) bounds.width() * bounds.height(); }
-        int centerX() { return bounds.centerX(); }
-        int centerY() { return bounds.centerY(); }
+        TranscriptRow(long timeMs) { this.timeMs = timeMs; }
     }
 
-    private static final class TapOutcome {
+    private static final class SeekOutcome {
         final long observedPosition;
         final boolean confirmed;
-        TapOutcome(long observedPosition, boolean confirmed) {
+        SeekOutcome(long observedPosition, boolean confirmed) {
             this.observedPosition = observedPosition;
             this.confirmed = confirmed;
         }
@@ -102,11 +93,19 @@ final class MediaControl {
             connect.setAccessible(true);
             // FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES: keep any user-enabled services running.
             connect.invoke(instance, 1);
+            AccessibilityServiceInfo serviceInfo = (AccessibilityServiceInfo)
+                    uiAutomationClass.getMethod("getServiceInfo").invoke(instance);
+            serviceInfo.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+                    | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+            uiAutomationClass.getMethod("setServiceInfo", AccessibilityServiceInfo.class)
+                    .invoke(instance, serviceInfo);
             automationLooper = thread;
             automation = instance;
             getAutomationRoot = uiAutomationClass.getMethod("getRootInActiveWindow");
             getAutomationWindows = uiAutomationClass.getMethod("getWindows");
             disconnectAutomation = uiAutomationClass.getMethod("disconnect");
+            try { clearAutomationCache = uiAutomationClass.getMethod("clearCache"); }
+            catch (NoSuchMethodException ignored) { clearAutomationCache = null; }
         } catch (Throwable error) {
             thread.quitSafely();
             Throwable cause = error instanceof java.lang.reflect.InvocationTargetException
@@ -123,6 +122,7 @@ final class MediaControl {
         automation = null;
         getAutomationRoot = null;
         getAutomationWindows = null;
+        clearAutomationCache = null;
         disconnectAutomation = null;
         if (automationLooper != null) {
             automationLooper.quitSafely();
@@ -195,16 +195,19 @@ final class MediaControl {
         } else if ("caption_previous".equals(action.kind) || "caption_next".equals(action.kind)) {
             if (!YOUTUBE.equals(packageName))
                 throw new IllegalStateException("字幕行跳转目前仅支持 YouTube");
-            return navigateTranscript(controller, state, action.kind, result);
+            ensureTranscriptAutomation();
+            if (isTranscriptPanelOpen()) return navigateTranscript(controller, state, action.kind, result);
+            int seconds = action.seconds != 0 ? action.seconds
+                    : "caption_previous".equals(action.kind) ? -10 : 10;
+            result.put("action", "seek").put("seconds", seconds).put("fallback", "no_transcript_panel");
+            return seek(controller, state, seconds, result);
+        } else if ("transcript_toggle".equals(action.kind)) {
+            if (!YOUTUBE.equals(packageName))
+                throw new IllegalStateException("开关转写文稿目前仅支持 YouTube");
+            ensureTranscriptAutomation();
+            return toggleTranscript(controller, result);
         } else if ("seek".equals(action.kind)) {
-            if ((state.getActions() & PlaybackState.ACTION_SEEK_TO) == 0)
-                throw new IllegalStateException("此应用的播放器不支持精确跳转");
-            long current = position(state);
-            long target = Math.max(0, current + action.seconds * 1000L);
-            long duration = duration(controller);
-            if (duration > 0) target = Math.min(duration, target);
-            controller.getTransportControls().seekTo(target);
-            result.put("seconds", action.seconds).put("positionBefore", current).put("target", target);
+            return seek(controller, state, action.seconds, result);
         } else if ("toggle".equals(action.kind)) {
             if (state.getState() == PlaybackState.STATE_PLAYING) {
                 if ((state.getActions() & (PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE)) == 0)
@@ -235,63 +238,232 @@ final class MediaControl {
         return result;
     }
 
+    private JSONObject seek(MediaController controller, PlaybackState state, int seconds, JSONObject result)
+            throws Exception {
+        if ((state.getActions() & PlaybackState.ACTION_SEEK_TO) == 0)
+            throw new IllegalStateException("此应用的播放器不支持精确跳转");
+        long current = position(state);
+        long target = Math.max(0, current + seconds * 1000L);
+        long duration = duration(controller);
+        if (duration > 0) target = Math.min(duration, target);
+        SeekOutcome outcome = seekAndConfirm(controller, target, current);
+        result.put("seconds", seconds).put("positionBefore", current).put("target", target)
+                .put("observedPosition", outcome.observedPosition).put("confirmed", outcome.confirmed);
+        return result;
+    }
+
+    private interface NodeMatch { boolean matches(AccessibilityNodeInfo node); }
+
+    /** The caller owns the returned node. Never operate on another app's active window. */
+    private AccessibilityNodeInfo findUiNode(NodeMatch match) throws Exception {
+        if (clearAutomationCache != null) clearAutomationCache.invoke(automation);
+        AccessibilityNodeInfo root = (AccessibilityNodeInfo) getAutomationRoot.invoke(automation);
+        // A newly connected automation session needs a moment to receive its first window.
+        if (root == null) {
+            Thread.sleep(100);
+            root = (AccessibilityNodeInfo) getAutomationRoot.invoke(automation);
+        }
+        if (root == null) return null;
+        if (!YOUTUBE.contentEquals(root.getPackageName() == null ? "" : root.getPackageName())) {
+            root.recycle();
+            throw new IllegalStateException("请保持 YouTube 在前台");
+        }
+        ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
+        pending.add(root);
+        try {
+            while (!pending.isEmpty()) {
+                AccessibilityNodeInfo node = pending.removeFirst();
+                try {
+                    if (node.isVisibleToUser() && match.matches(node))
+                        return AccessibilityNodeInfo.obtain(node);
+                    for (int i = 0; i < node.getChildCount(); i++) {
+                        AccessibilityNodeInfo child = node.getChild(i);
+                        if (child != null) pending.addLast(child);
+                    }
+                } finally { node.recycle(); }
+            }
+            return null;
+        } finally { while (!pending.isEmpty()) pending.removeFirst().recycle(); }
+    }
+
+    private AccessibilityNodeInfo nodeById(String id) throws Exception {
+        return findUiNode(node -> (YOUTUBE + ":id/" + id).equals(node.getViewIdResourceName()));
+    }
+
+    private static boolean labelEquals(AccessibilityNodeInfo node, String... labels) {
+        for (String label : labels) {
+            if (node.getText() != null && label.equalsIgnoreCase(node.getText().toString().trim())) return true;
+            if (node.getContentDescription() != null
+                    && label.equalsIgnoreCase(node.getContentDescription().toString().trim())) return true;
+            if (node.getHintText() != null && label.equalsIgnoreCase(node.getHintText().toString().trim())) return true;
+        }
+        return false;
+    }
+
+    private boolean isTranscriptPanelOpen() throws Exception {
+        AccessibilityNodeInfo title = findUiNode(node ->
+                ((YOUTUBE + ":id/horizontal_title_row").equals(node.getViewIdResourceName())
+                        || (YOUTUBE + ":id/modern_title").equals(node.getViewIdResourceName()))
+                        && labelEquals(node, "转写文稿", "Transcript"));
+        if (title != null) { title.recycle(); return true; }
+        return hasTranscriptSearchField();
+    }
+
+    private static boolean clickNode(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+        try { return node.isEnabled() && node.performAction(AccessibilityNodeInfo.ACTION_CLICK); }
+        finally { node.recycle(); }
+    }
+
+    private boolean clickTranscriptEntry() throws Exception {
+        return clickNode(findUiNode(node -> node.isClickable() && labelEquals(node,
+                "内容转文字", "显示转写文稿", "查看转写文稿", "Show transcript", "View transcript")));
+    }
+
+    private boolean closeSheet() throws Exception {
+        AccessibilityNodeInfo close = nodeById("close_button");
+        if (close == null) {
+            AccessibilityNodeInfo handle = nodeById("arrow_drag_handle");
+            if (handle == null) return false;
+            Rect header = new Rect(); handle.getBoundsInScreen(header); handle.recycle();
+            int maxHeaderHeight = Math.round(100 * systemContext().getResources().getDisplayMetrics().density);
+            close = findUiNode(node -> {
+                Rect bounds = new Rect(); node.getBoundsInScreen(bounds);
+                return node.isClickable() && labelEquals(node, "关闭", "Close")
+                        && bounds.top >= header.top && bounds.bottom <= header.bottom + maxHeaderHeight;
+            });
+        }
+        return clickNode(close);
+    }
+
+    private boolean waitForTranscript(boolean open, long timeoutMs) throws Exception {
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        do {
+            if (isTranscriptPanelOpen() == open) return true;
+            Thread.sleep(75);
+        } while (SystemClock.elapsedRealtime() < deadline);
+        return false;
+    }
+
+    private static String mediaTitle(MediaController controller) {
+        MediaMetadata metadata = controller.getMetadata();
+        return metadata == null ? null : metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
+    }
+
+    private void checkSameVideo(MediaController controller, String title) {
+        if (title != null && !title.equals(mediaTitle(controller)))
+            throw new IllegalStateException("当前视频已改变，已停止文稿操作");
+    }
+
+    private JSONObject toggleTranscript(MediaController controller, JSONObject result) throws Exception {
+        long started = SystemClock.elapsedRealtime();
+        if (isTranscriptPanelOpen()) {
+            dismissTranscriptSearchKeyboard();
+            if (!closeSheet() || !waitForTranscript(false, 1200))
+                throw new IllegalStateException("无法关闭 YouTube 转写文稿面板");
+            return result.put("transcriptOpen", false).put("elapsedMs", SystemClock.elapsedRealtime() - started);
+        }
+        String title = mediaTitle(controller);
+        // An already-open description may have its entry in view.
+        if (clickTranscriptEntry()) {
+            if (waitForTranscript(true, 5000))
+                return result.put("transcriptOpen", true).put("elapsedMs", SystemClock.elapsedRealtime() - started);
+            throw new IllegalStateException("文稿尚未载入，请稍后重试");
+        }
+        AccessibilityNodeInfo sheet = nodeById("arrow_drag_handle");
+        if (sheet != null) {
+            sheet.recycle();
+            if (!closeSheet()) throw new IllegalStateException("请先关闭当前的视频面板");
+            Thread.sleep(180);
+        }
+        checkSameVideo(controller, title);
+        if (!openVideoDescription())
+            throw new IllegalStateException("请在当前视频的竖屏播放页使用文稿键");
+        Thread.sleep(180);
+        // This is the description opened from the verified watch-list header. Scroll only
+        // its RecyclerView; never swipe recommendations or tap approximate screen positions.
+        for (int attempt = 0; attempt < 15; attempt++) {
+            checkSameVideo(controller, title);
+            if (isTranscriptPanelOpen())
+                return result.put("transcriptOpen", true).put("elapsedMs", SystemClock.elapsedRealtime() - started);
+            if (clickTranscriptEntry()) {
+                if (waitForTranscript(true, 5000))
+                    return result.put("transcriptOpen", true).put("elapsedMs", SystemClock.elapsedRealtime() - started);
+                throw new IllegalStateException("文稿尚未载入，请稍后重试");
+            }
+            if (!scrollResults(true)) break;
+            Thread.sleep(100);
+        }
+        throw new IllegalStateException("当前视频简介中未找到转写文稿入口");
+    }
+
+    private boolean openVideoDescription() throws Exception {
+        AccessibilityNodeInfo player = nodeById("watch_player");
+        if (player == null) return false;
+        Rect playerBounds = new Rect(); player.getBoundsInScreen(playerBounds); player.recycle();
+        AccessibilityNodeInfo list = nodeById("watch_list");
+        if (list == null) return false;
+        try {
+            AccessibilityNodeInfo header = list.getChild(0);
+            if (header == null) return false;
+            Rect bounds = new Rect(); header.getBoundsInScreen(bounds);
+            float density = systemContext().getResources().getDisplayMetrics().density;
+            // YouTube's title renderer can have no accessible text. Its first watch-list
+            // child is nevertheless a real clickable header, directly beneath the player.
+            boolean valid = header.isVisibleToUser() && header.isClickable()
+                    && bounds.width() >= playerBounds.width() * 0.9
+                    && Math.abs(bounds.top - playerBounds.bottom) <= 20 * density
+                    && bounds.height() >= 50 * density && bounds.height() <= 180 * density;
+            if (!valid) { header.recycle(); return false; }
+            return clickNode(header);
+        } finally { list.recycle(); }
+    }
+
+    private boolean scrollResults(boolean forward) throws Exception {
+        AccessibilityNodeInfo list = nodeById("results");
+        if (list == null) return false;
+        try { return list.performAction(forward ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                : AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD); }
+        finally { list.recycle(); }
+    }
+
     private JSONObject navigateTranscript(MediaController controller, PlaybackState initial,
                                          String action, JSONObject result) throws Exception {
         long actionStarted = SystemClock.elapsedRealtime();
-        ensureTranscriptAutomation();
         dismissTranscriptSearchKeyboard();
         boolean next = "caption_next".equals(action);
         long current = position(initial);
-        int screenHeight = systemContext().getResources().getDisplayMetrics().heightPixels;
         TranscriptRow target = null;
-        for (int attempt = 0; attempt < 5; attempt++) {
-            List<TranscriptRow> rows = readTranscriptRows(screenHeight);
-            target = adjacentRow(rows, current, next);
+        List<TranscriptRow> rows = new ArrayList<>();
+        for (int attempt = 0; attempt < 6; attempt++) {
+            rows = readTranscriptRows();
+            if (rows.isEmpty()) throw new IllegalStateException("文稿尚未载入字幕行，请稍后再试");
+            long first = rows.get(0).timeMs;
+            long last = rows.get(rows.size() - 1).timeMs;
+            // A manually scrolled list must first include the current playback cue.
+            boolean outside = current < first || current > last;
+            if (!outside) target = adjacentRow(rows, current, next);
             if (target != null) break;
-            if (rows.isEmpty())
-                throw new IllegalStateException("未找到字幕行；请先在 YouTube 打开“转写文稿”");
-            scrollTranscript(rows, next, screenHeight);
+            boolean scrollForward = current > last || (current >= first && next);
+            if (!scrollResults(scrollForward)) {
+                // At the end of the list, the last cue can continue to the video's end.
+                if (current >= last) target = adjacentRow(rows, current, next);
+                break;
+            }
+            Thread.sleep(100);
         }
         if (target == null)
-            throw new IllegalStateException(next ? "转写列表中没有后续字幕行" : "转写列表中没有更早的字幕行");
-
-        // YouTube can auto-scroll the transcript while the video is playing. Refresh both
-        // the playback position and row bounds immediately before tapping to avoid stale coords.
-        PlaybackState freshState = controller.getPlaybackState();
-        if (freshState != null) current = position(freshState);
-        List<TranscriptRow> freshRows = readTranscriptRows(screenHeight);
-        TranscriptRow freshTarget = adjacentRow(freshRows, current, next);
-        if (freshTarget == null) freshTarget = findRow(freshRows, target.timeMs);
-        if (freshTarget == null)
-            throw new IllegalStateException("转写列表正在滚动，未能重新定位目标字幕；请再按一次");
-        target = freshTarget;
-
-        long beforeTapStarted = SystemClock.elapsedRealtime();
-        TapOutcome outcome = tapAndConfirm(controller, target, current);
-        boolean searchFocused = !outcome.confirmed && isTranscriptSearchFocused();
-        if (searchFocused) dismissTranscriptSearchKeyboard();
-        if (!outcome.confirmed && (searchFocused || Math.abs(outcome.observedPosition - target.timeMs) > 2500)) {
-            PlaybackState retryState = controller.getPlaybackState();
-            long retryCurrent = retryState == null ? current : position(retryState);
-            List<TranscriptRow> retryRows = readTranscriptRows(screenHeight);
-            TranscriptRow retryTarget = adjacentRow(retryRows, retryCurrent, next);
-            if (retryTarget == null) retryTarget = findRow(retryRows, target.timeMs);
-            if (retryTarget != null) {
-                target = retryTarget;
-                current = retryCurrent;
-                outcome = tapAndConfirm(controller, target, current);
-            }
-        }
+            throw new IllegalStateException(next ? "未找到下一句字幕" : "未找到上一句字幕");
+        long lookupFinished = SystemClock.elapsedRealtime();
+        // The timestamp is the meaningful target. A media seek cannot accidentally focus
+        // the search box when YouTube scrolls or changes the row's screen coordinates.
+        SeekOutcome outcome = seekAndConfirm(controller, target.timeMs, current);
         result.put("targetPosition", target.timeMs).put("observedPosition", outcome.observedPosition)
-                .put("confirmed", outcome.confirmed)
-                .put("lookupMs", beforeTapStarted - actionStarted)
-                .put("tapAndConfirmMs", SystemClock.elapsedRealtime() - beforeTapStarted)
-                .put("tapX", target.centerX()).put("tapY", target.centerY())
-                .put("visibleTranscriptTimes", transcriptTimes(freshRows));
+                .put("confirmed", outcome.confirmed).put("lookupMs", lookupFinished - actionStarted)
+                .put("seekAndConfirmMs", SystemClock.elapsedRealtime() - lookupFinished)
+                .put("visibleTranscriptTimes", transcriptTimes(rows));
         if (!outcome.confirmed)
-            throw new IllegalStateException("已点选字幕行，但播放器未确认跳转（目标 " + target.timeMs
-                    + " 毫秒，当前 " + outcome.observedPosition + " 毫秒，点按位置 "
-                    + target.centerX() + "," + target.centerY() + "）");
+            throw new IllegalStateException("播放器尚未确认字幕跳转（目标 " + target.timeMs + " 毫秒）");
         return result;
     }
 
@@ -309,11 +481,6 @@ final class MediaControl {
         return target;
     }
 
-    private static TranscriptRow findRow(List<TranscriptRow> rows, long timeMs) {
-        for (TranscriptRow row : rows) if (row.timeMs == timeMs) return row;
-        return null;
-    }
-
     private static String transcriptTimes(List<TranscriptRow> rows) {
         StringBuilder times = new StringBuilder();
         for (TranscriptRow row : rows) {
@@ -323,60 +490,28 @@ final class MediaControl {
         return times.toString();
     }
 
-    private TapOutcome tapAndConfirm(MediaController controller, TranscriptRow target, long current)
+    private SeekOutcome seekAndConfirm(MediaController controller, long target, long current)
             throws Exception {
-        long started = SystemClock.elapsedRealtime();
         PlaybackState before = controller.getPlaybackState();
-        long beforePosition = before == null ? current : position(before);
-        float speed = before == null ? 0 : before.getPlaybackSpeed();
-        boolean playing = before != null && before.getState() == PlaybackState.STATE_PLAYING;
-        runCommand(new String[]{"/system/bin/input", "tap", String.valueOf(target.centerX()),
-                String.valueOf(target.centerY())}, 2500);
-        long observed = -1;
-        boolean confirmed = false;
-        for (int sample = 0; sample < 6; sample++) {
-            Thread.sleep(75);
+        if (before == null || (before.getActions() & PlaybackState.ACTION_SEEK_TO) == 0)
+            throw new IllegalStateException("此应用的播放器不支持精确跳转");
+        long started = SystemClock.elapsedRealtime();
+        long beforePosition = position(before);
+        boolean playing = before.getState() == PlaybackState.STATE_PLAYING;
+        controller.getTransportControls().seekTo(target);
+        long observed = current;
+        for (int sample = 0; sample < 10; sample++) {
+            Thread.sleep(60);
             PlaybackState state = controller.getPlaybackState();
             if (state == null) continue;
             observed = position(state);
             long elapsed = SystemClock.elapsedRealtime() - started;
-            long naturalPosition = beforePosition + (playing ? (long) (elapsed * speed) : 0);
-            long expectedTarget = target.timeMs + (playing ? (long) (elapsed * speed) : 0);
-            boolean nearTarget = Math.abs(observed - expectedTarget) <= 1800;
-            boolean movedFromNatural = Math.abs(naturalPosition - expectedTarget) < 1000
-                    || Math.abs(observed - expectedTarget) + 1000 < Math.abs(observed - naturalPosition);
-            if (nearTarget && movedFromNatural) {
-                confirmed = true;
-                break;
-            }
+            long expected = target + (playing ? (long) (elapsed * before.getPlaybackSpeed()) : 0);
+            boolean moved = Math.abs(beforePosition - target) < 500
+                    || state.getLastPositionUpdateTime() != before.getLastPositionUpdateTime();
+            if (moved && Math.abs(observed - expected) <= 1200) return new SeekOutcome(observed, true);
         }
-        return new TapOutcome(observed, confirmed);
-    }
-
-    private boolean isTranscriptSearchFocused() {
-        try {
-            AccessibilityNodeInfo root = (AccessibilityNodeInfo) getAutomationRoot.invoke(automation);
-            if (root == null) return false;
-            ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
-            pending.add(root);
-            while (!pending.isEmpty()) {
-                AccessibilityNodeInfo node = pending.removeFirst();
-                try {
-                    CharSequence text = node.getText();
-                    CharSequence hint = node.getHintText();
-                    CharSequence description = node.getContentDescription();
-                    boolean searchLabel = (text != null && text.toString().contains("搜索转写内容"))
-                            || (hint != null && hint.toString().contains("搜索转写内容"))
-                            || (description != null && description.toString().contains("搜索转写内容"));
-                    if (node.isFocused() && (searchLabel || node.isEditable())) return true;
-                    for (int i = 0; i < node.getChildCount(); i++) {
-                        AccessibilityNodeInfo child = node.getChild(i);
-                        if (child != null) pending.addLast(child);
-                    }
-                } finally { node.recycle(); }
-            }
-        } catch (Throwable ignored) { }
-        return false;
+        return new SeekOutcome(observed, false);
     }
 
     private void dismissTranscriptSearchKeyboard() throws Exception {
@@ -387,147 +522,55 @@ final class MediaControl {
         Thread.sleep(120);
     }
 
-    private boolean hasTranscriptSearchField() {
+    private boolean hasTranscriptSearchField() throws Exception {
+        AccessibilityNodeInfo search = findUiNode(node -> labelEquals(node,
+                "搜索转写内容", "Search transcript", "Search in transcript"));
+        if (search == null) return false;
+        search.recycle();
+        return true;
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean isInputMethodVisible() throws Exception {
+        List<AccessibilityWindowInfo> windows =
+                (List<AccessibilityWindowInfo>) getAutomationWindows.invoke(automation);
+        boolean shown = false;
+        if (windows != null) for (AccessibilityWindowInfo window : windows) {
+            if (window == null) continue;
+            if (window.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) shown = true;
+            window.recycle();
+        }
+        return shown;
+    }
+
+    private List<TranscriptRow> readTranscriptRows() throws Exception {
+        AccessibilityNodeInfo root = nodeById("results");
+        if (root == null) throw new IllegalStateException("无法读取 YouTube 文稿列表");
+        Map<Long, TranscriptRow> unique = new LinkedHashMap<>();
+        ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
+        pending.add(root);
         try {
-            AccessibilityNodeInfo root = (AccessibilityNodeInfo) getAutomationRoot.invoke(automation);
-            if (root == null) return false;
-            ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
-            pending.add(root);
             while (!pending.isEmpty()) {
                 AccessibilityNodeInfo node = pending.removeFirst();
                 try {
-                    CharSequence text = node.getText();
-                    CharSequence hint = node.getHintText();
-                    CharSequence description = node.getContentDescription();
-                    if ((text != null && text.toString().contains("搜索转写内容"))
-                            || (hint != null && hint.toString().contains("搜索转写内容"))
-                            || (description != null && description.toString().contains("搜索转写内容")))
-                        return true;
+                    String description = node.getContentDescription() == null ? null
+                            : node.getContentDescription().toString();
+                    long timeMs = TranscriptTimestampParser.parsePrefix(description);
+                    // YouTube exposes each cue as a full accessibility description. Do not
+                    // interpret arbitrary caption sentence text as a separate timestamp.
+                    if (timeMs >= 0) {
+                        unique.put(timeMs, new TranscriptRow(timeMs));
+                    }
                     for (int i = 0; i < node.getChildCount(); i++) {
                         AccessibilityNodeInfo child = node.getChild(i);
                         if (child != null) pending.addLast(child);
                     }
                 } finally { node.recycle(); }
             }
-        } catch (Throwable ignored) { }
-        return false;
-    }
-
-    @SuppressWarnings("unchecked")
-    private boolean isInputMethodVisible() {
-        try {
-            List<AccessibilityWindowInfo> windows = (List<AccessibilityWindowInfo>) getAutomationWindows.invoke(automation);
-            if (windows != null) {
-                for (AccessibilityWindowInfo window : windows) {
-                    if (window == null) continue;
-                    try {
-                        if (window.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return true;
-                    } finally { window.recycle(); }
-                }
-            }
-        } catch (Throwable ignored) { }
-        // Some OEM builds omit the IME from UiAutomation.getWindows() while it visibly
-        // covers the transcript. Fall back to the system input-method state.
-        Process process = null;
-        try {
-            process = new ProcessBuilder("/system/bin/dumpsys", "input_method")
-                    .redirectErrorStream(true).start();
-            StringBuilder output = new StringBuilder();
-            try (java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.contains("mInputShown=") || line.contains("mShowRequested="))
-                        output.append(line).append('\n');
-                }
-            }
-            if (!process.waitFor(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly();
-                return false;
-            }
-            String state = output.toString();
-            return state.contains("mInputShown=true") || state.contains("mShowRequested=true");
-        } catch (Throwable ignored) {
-            if (process != null) process.destroyForcibly();
-            return false;
-        }
-    }
-
-    private List<TranscriptRow> readTranscriptRows(int screenHeight) throws Exception {
-        ensureTranscriptAutomation();
-        AccessibilityNodeInfo root;
-        try { root = (AccessibilityNodeInfo) getAutomationRoot.invoke(automation); }
-        catch (java.lang.reflect.InvocationTargetException error) {
-            Throwable cause = error.getCause() == null ? error : error.getCause();
-            throw new IllegalStateException("读取 YouTube 界面失败：" +
-                    (cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage()), cause);
-        }
-        if (root == null) throw new IllegalStateException("无法读取当前界面；请保持 YouTube 转写文稿打开");
-        Map<Long, TranscriptRow> unique = new LinkedHashMap<>();
-        ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
-        pending.add(root);
-        while (!pending.isEmpty()) {
-            AccessibilityNodeInfo node = pending.removeFirst();
-            try {
-                String description = node.getContentDescription() == null ? null
-                        : node.getContentDescription().toString();
-                String text = node.getText() == null ? null : node.getText().toString();
-                String value = description != null && TRANSCRIPT_TIME.matcher(description).find()
-                        ? description : text;
-                if (value != null) {
-                    Matcher time = TRANSCRIPT_TIME.matcher(value);
-                    if (time.find()) {
-                        long hours = parsePart(time.group(1));
-                        long minutes = parsePart(time.group(2));
-                        long seconds = parsePart(time.group(3));
-                        long timeMs = ((hours * 60 + minutes) * 60 + seconds) * 1000L;
-                        Rect bounds = new Rect();
-                        node.getBoundsInScreen(bounds);
-                        Rect visibleBounds = new Rect(bounds);
-                        int screenWidth = systemContext().getResources().getDisplayMetrics().widthPixels;
-                        if (visibleBounds.intersect(0, 0, screenWidth, screenHeight)
-                                && visibleBounds.top >= screenHeight * 0.44) {
-                            TranscriptRow candidate = new TranscriptRow(timeMs, visibleBounds);
-                            TranscriptRow existing = unique.get(timeMs);
-                            if (existing == null || candidate.area() > existing.area()) unique.put(timeMs, candidate);
-                        }
-                    }
-                }
-                for (int i = 0; i < node.getChildCount(); i++) {
-                    AccessibilityNodeInfo child = node.getChild(i);
-                    if (child != null) pending.addLast(child);
-                }
-            } finally { node.recycle(); }
-        }
+        } finally { while (!pending.isEmpty()) pending.removeFirst().recycle(); }
         List<TranscriptRow> rows = new ArrayList<>(unique.values());
         rows.sort(Comparator.comparingLong(row -> row.timeMs));
         return rows;
-    }
-
-    private static long parsePart(String value) { return value == null ? 0 : Long.parseLong(value); }
-
-    private static void scrollTranscript(List<TranscriptRow> rows, boolean forward, int screenHeight)
-            throws Exception {
-        int top = screenHeight;
-        int bottom = 0;
-        for (TranscriptRow row : rows) {
-            top = Math.min(top, row.bounds.top);
-            bottom = Math.max(bottom, row.bounds.bottom);
-        }
-        int startY;
-        int endY;
-        if (forward) {
-            startY = Math.min(screenHeight - 220, Math.max(bottom - 100, screenHeight * 3 / 4));
-            endY = Math.max(screenHeight / 2, startY - 550);
-        } else {
-            startY = Math.max(screenHeight / 2, Math.min(top + 120, screenHeight * 2 / 3));
-            endY = Math.min(screenHeight - 220, startY + 550);
-        }
-        if (Math.abs(startY - endY) < 200) throw new IllegalStateException("无法滚动转写文稿列表");
-        int x = systemContext().getResources().getDisplayMetrics().widthPixels / 2;
-        runCommand(new String[]{"/system/bin/input", "swipe", String.valueOf(x), String.valueOf(startY),
-                String.valueOf(x), String.valueOf(endY), "350"}, 2500);
-        Thread.sleep(350);
     }
 
     private static void runCommand(String[] arguments, long timeoutMs) throws Exception {

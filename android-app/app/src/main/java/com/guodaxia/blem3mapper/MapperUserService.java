@@ -25,6 +25,7 @@ import java.util.regex.Pattern;
 public final class MapperUserService extends IMapperService.Stub {
     private static final String PACKAGE = "com.guodaxia.blem3mapper";
     private static final String TAG = "BleMapper";
+    private static final long CENTER_DOUBLE_CLICK_MS = 320;
     private static final Pattern FOCUS = Pattern.compile(
             "mCurrentFocus=Window\\{[^}]*\\s([A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+)/[^}]*\\}");
     private static final Pattern ACTION = Pattern.compile("^ACTION (UP|DOWN|LEFT|RIGHT|CENTER|PHOTO)(?: .*)?$");
@@ -42,7 +43,21 @@ public final class MapperUserService extends IMapperService.Stub {
     private static final class Line {
         final Process process;
         final String value;
-        Line(Process process, String value) { this.process = process; this.value = value; }
+        final long receivedAt;
+        Line(Process process, String value) {
+            this.process = process;
+            this.value = value;
+            this.receivedAt = SystemClock.elapsedRealtime();
+        }
+    }
+
+    private static final class PendingCenter {
+        final Process process;
+        final String packageName;
+        PendingCenter(Process process, String packageName) {
+            this.process = process;
+            this.packageName = packageName;
+        }
     }
 
     private static final class Focus {
@@ -260,9 +275,21 @@ public final class MapperUserService extends IMapperService.Stub {
             log("手机端映射已启动；只在已配置的应用中接管遥控器");
             long nextFocus = 0;
             String capturePackage = "";
+            CenterClickTracker<PendingCenter> centerClicks = new CenterClickTracker<>(CENTER_DOUBLE_CLICK_MS);
             while (!run.stopping) {
                 long now = SystemClock.elapsedRealtime();
-                if (now >= nextFocus) {
+                CenterClickTracker.Click<PendingCenter> completedCenter;
+                // Serialize the deadline decision with timestamping/enqueueing by the reader.
+                synchronized (run.lines) {
+                    completedCenter = centerClicks.expire(now, !run.lines.isEmpty());
+                }
+                if (completedCenter != null) {
+                    dispatchCenterClick(run, media, completedCenter, capturePackage);
+                    nextFocus = 0;
+                }
+                // Foreground polling can take longer than the double-click window. Resolve
+                // buffered gestures first; every resulting action still validates focus below.
+                if (!centerClicks.hasPending() && run.lines.isEmpty() && now >= nextFocus) {
                     Focus focus = readFocus(run);
                     if (run.stopping) break;
                     updateFocus(run, focus);
@@ -297,9 +324,11 @@ public final class MapperUserService extends IMapperService.Stub {
                     nextFocus = SystemClock.elapsedRealtime() + 500;
                 }
                 if (run.readerFailure != null) throw new IllegalStateException(run.readerFailure);
-                Line line = run.lines.poll(50, TimeUnit.MILLISECONDS);
+                long pollMs = centerClicks.pollMillis(SystemClock.elapsedRealtime(), 50);
+                Line line = run.lines.poll(pollMs, TimeUnit.MILLISECONDS);
                 if (line == null || line.process != run.capture) continue;
                 if (line.value == null) {
+                    centerClicks.cancel();
                     int exit = line.process.isAlive() ? -1 : line.process.exitValue();
                     stopCapture(run);
                     run.retryAfter = SystemClock.elapsedRealtime() + 2500;
@@ -308,6 +337,23 @@ public final class MapperUserService extends IMapperService.Stub {
                 }
                 Matcher action = ACTION.matcher(line.value);
                 if (action.matches()) {
+                    String button = action.group(1);
+                    ProfileConfig.Profile capturedProfile = run.config.profiles.get(capturePackage);
+                    if ("CENTER".equals(button) && "com.google.android.youtube".equals(capturePackage)
+                            && capturedProfile != null
+                            && "toggle".equals(capturedProfile.buttons.get("CENTER").kind)) {
+                        completedCenter = centerClicks.press(line.process,
+                                new PendingCenter(line.process, capturePackage), line.receivedAt);
+                        if (completedCenter != null) {
+                            dispatchCenterClick(run, media, completedCenter, capturePackage);
+                            nextFocus = 0;
+                        }
+                        continue;
+                    }
+                    // A different physical button ends the pair; preserve its order after
+                    // the preceding single center click rather than combining across it.
+                    completedCenter = centerClicks.takeSingle();
+                    if (completedCenter != null) dispatchCenterClick(run, media, completedCenter, capturePackage);
                     // Refresh on each completed physical gesture; do not act on stale foreground data.
                     Focus focus = readFocus(run);
                     if (run.stopping) break;
@@ -321,13 +367,14 @@ public final class MapperUserService extends IMapperService.Stub {
                         nextFocus = 0;
                         continue;
                     }
-                    handleAction(run, media, profile, action.group(1));
+                    handleAction(run, media, profile, button);
                 } else if (line.value.startsWith("LISTENER_READY")) {
                     run.connected = true;
                     status(run, "已接管 BLE-M3 · " + run.profile);
                 } else if (line.value.startsWith("WAITING_FOR_DEVICE") ||
                         line.value.startsWith("DEVICE_DISCONNECTED") ||
                         line.value.startsWith("DEVICE_READ_INTERRUPTED")) {
+                    centerClicks.cancel();
                     run.connected = false;
                     status(run, "等待 BLE-M3 连接或唤醒 · " + run.profile);
                 } else if (line.value.startsWith("GRAB_FAILED")) {
@@ -337,6 +384,7 @@ public final class MapperUserService extends IMapperService.Stub {
                             ? "遥控器正被另一控制服务占用，请停止旧服务后重新开始映射"
                             : "无法接管遥控器，请检查 Shizuku 权限后重新开始映射");
                 } else if (line.value.startsWith("ERROR") || line.value.startsWith("WARNING")) {
+                    if (line.value.startsWith("WARNING input queue overflow")) centerClicks.cancel();
                     Log.w(TAG, line.value);
                 }
             }
@@ -358,9 +406,31 @@ public final class MapperUserService extends IMapperService.Stub {
 
     private static boolean needsTranscriptAutomation(ProfileConfig.Profile profile) {
         for (ProfileConfig.Action action : profile.buttons.values()) {
-            if ("caption_previous".equals(action.kind) || "caption_next".equals(action.kind)) return true;
+            if ("caption_previous".equals(action.kind) || "caption_next".equals(action.kind)
+                    || "transcript_toggle".equals(action.kind)) return true;
         }
         return false;
+    }
+
+    private void dispatchCenterClick(Run run, MediaControl media,
+                                     CenterClickTracker.Click<PendingCenter> click,
+                                     String capturePackage) throws InterruptedException {
+        PendingCenter pending = click.context;
+        if (run.stopping || pending.process != run.capture || !pending.packageName.equals(capturePackage)) return;
+        Focus focus = readFocus(run);
+        if (run.stopping) return;
+        updateFocus(run, focus);
+        if (!pending.packageName.equals(focus.availablePackage())) {
+            log("中键操作已取消：当前应用已切换");
+            return;
+        }
+        ProfileConfig.Profile profile = run.config.profiles.get(pending.packageName);
+        if (profile == null) return;
+        if (click.doubleClick) {
+            handleAction(run, media, profile, "CENTER", "like");
+        } else {
+            handleAction(run, media, profile, "CENTER");
+        }
     }
 
     private void updateFocus(Run run, Focus focus) {
@@ -381,7 +451,11 @@ public final class MapperUserService extends IMapperService.Stub {
                     child.getInputStream(), StandardCharsets.UTF_8))) {
                 String value;
                 while (!run.stopping && (value = input.readLine()) != null) {
-                    if (!run.lines.offer(new Line(child, value))) {
+                    boolean offered;
+                    synchronized (run.lines) {
+                        offered = run.lines.offer(new Line(child, value));
+                    }
+                    if (!offered) {
                         run.readerFailure = "按键事件积压，已停止接管，请重新开始";
                         terminate(child);
                         break;
@@ -390,7 +464,9 @@ public final class MapperUserService extends IMapperService.Stub {
             } catch (Exception error) {
                 if (!run.stopping && run.capture == child) Log.w(TAG, "Capture reader stopped", error);
             } finally {
-                run.lines.offer(new Line(child, null));
+                synchronized (run.lines) {
+                    run.lines.offer(new Line(child, null));
+                }
             }
         }, "ble-mapper-input");
         reader.setDaemon(true);
@@ -428,8 +504,15 @@ public final class MapperUserService extends IMapperService.Stub {
 
     private void handleAction(Run run, MediaControl media, ProfileConfig.Profile profile, String button)
             throws InterruptedException {
-        ProfileConfig.Action action = profile.buttons.get(button);
-        String prefix = profile.name + " · " + ProfileConfig.label(button) + "：";
+        handleAction(run, media, profile, button, null);
+    }
+
+    private void handleAction(Run run, MediaControl media, ProfileConfig.Profile profile, String button,
+                              String forcedKind) throws InterruptedException {
+        ProfileConfig.Action configured = profile.buttons.get(button);
+        ProfileConfig.Action action = forcedKind == null ? configured : new ProfileConfig.Action(forcedKind, 0);
+        String prefix = "CENTER".equals(button) && "like".equals(forcedKind)
+                ? profile.name + " · 中键双击：" : profile.name + " · " + ProfileConfig.label(button) + "：";
         if ("none".equals(action.kind)) {
             log(prefix + "未分配操作");
             return;
@@ -441,9 +524,15 @@ public final class MapperUserService extends IMapperService.Stub {
             if ("seek".equals(action.kind)) {
                 description = (action.seconds < 0 ? "后退 " : "前进 ") + Math.abs(action.seconds) + " 秒";
             } else if ("caption_previous".equals(action.kind)) {
-                description = "跳到上一条字幕 " + formatCaptionTime(result.optLong("targetPosition", -1));
+                description = result.has("fallback") ? "转写文稿未打开，后退 "
+                        + Math.abs(result.optInt("seconds", action.seconds)) + " 秒"
+                        : "跳到上一条字幕 " + formatCaptionTime(result.optLong("targetPosition", -1));
             } else if ("caption_next".equals(action.kind)) {
-                description = "跳到下一条字幕 " + formatCaptionTime(result.optLong("targetPosition", -1));
+                description = result.has("fallback") ? "转写文稿未打开，前进 "
+                        + Math.abs(result.optInt("seconds", action.seconds)) + " 秒"
+                        : "跳到下一条字幕 " + formatCaptionTime(result.optLong("targetPosition", -1));
+            } else if ("transcript_toggle".equals(action.kind)) {
+                description = result.optBoolean("transcriptOpen") ? "已打开转写文稿" : "已关闭转写文稿";
             } else if ("like".equals(action.kind)) {
                 description = result.optBoolean("alreadyLiked") ? "已经赞过，保持点赞"
                         : result.optBoolean("confirmed") ? "已点赞" : "已发送点赞，请在 YouTube 中确认";

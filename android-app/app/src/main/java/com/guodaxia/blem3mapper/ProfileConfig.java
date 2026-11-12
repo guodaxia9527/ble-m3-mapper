@@ -1,6 +1,7 @@
 package com.guodaxia.blem3mapper;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.Collections;
@@ -76,6 +77,13 @@ final class ProfileConfig {
                 } else if ("caption_previous".equals(kind) || "caption_next".equals(kind)) {
                     if (!"com.google.android.youtube".equals(packageName))
                         throw new IllegalArgumentException("字幕行跳转目前仅支持 YouTube");
+                    boolean previous = "caption_previous".equals(kind);
+                    seconds = mapping.has("seconds") ? integer(mapping, "seconds") : (previous ? -10 : 10);
+                    if (seconds == 0 || seconds < -300 || seconds > 300 || (seconds < 0) != previous)
+                        throw new IllegalArgumentException("字幕关闭时的跳转时间应为同方向的 1 至 300 秒");
+                } else if ("transcript_toggle".equals(kind)) {
+                    if (!"com.google.android.youtube".equals(packageName))
+                        throw new IllegalArgumentException("开关转写文稿目前仅支持 YouTube");
                 } else if (!"toggle".equals(kind) && !"like".equals(kind) && !"none".equals(kind)) {
                     throw new IllegalArgumentException("暂不支持的按键操作：" + kind);
                 }
@@ -84,6 +92,46 @@ final class ProfileConfig {
             profiles.put(packageName, new Profile(name, packageName, actions));
         }
         return new ProfileConfig(profiles);
+    }
+
+    /** Upgrade only the YouTube defaults covered by this feature; retain custom seconds and other apps. */
+    static boolean migrateYoutubeActions(JSONObject root, boolean updatePhoto, boolean updateCaptions)
+            throws JSONException {
+        boolean changed = false;
+        JSONArray profiles = root.getJSONArray("profiles");
+        for (int i = 0; i < profiles.length(); i++) {
+            JSONObject profile = profiles.getJSONObject(i);
+            if (!"com.google.android.youtube".equals(profile.optString("package"))) continue;
+            JSONObject buttons = profile.getJSONObject("buttons");
+            JSONObject photo = buttons.optJSONObject("PHOTO");
+            if (updatePhoto && photo != null && "like".equals(photo.optString("action"))) {
+                photo.put("action", "transcript_toggle");
+                changed = true;
+            }
+            if (updateCaptions) {
+                changed |= migrateCaptionAction(buttons, "LEFT", "caption_previous", -10);
+                changed |= migrateCaptionAction(buttons, "RIGHT", "caption_next", 10);
+            }
+        }
+        return changed;
+    }
+
+    private static boolean migrateCaptionAction(JSONObject buttons, String button, String kind, int defaultSeconds)
+            throws JSONException {
+        JSONObject mapping = buttons.optJSONObject(button);
+        if (mapping == null) return false;
+        String action = mapping.optString("action");
+        int seconds = mapping.optInt("seconds", 0);
+        if ("seek".equals(action) && seconds != 0 && seconds >= -300 && seconds <= 300
+                && (seconds < 0) == (defaultSeconds < 0)) {
+            mapping.put("action", kind);
+            return true;
+        }
+        if (kind.equals(action) && !mapping.has("seconds")) {
+            mapping.put("seconds", defaultSeconds);
+            return true;
+        }
+        return false;
     }
 
     private static int integer(JSONObject object, String key) throws Exception {

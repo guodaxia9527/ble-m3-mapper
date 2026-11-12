@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Color;
@@ -49,10 +50,12 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
     private static final int BACKGROUND = Color.rgb(245, 247, 252);
     private static final String[] BUTTON_KEYS = {"UP", "DOWN", "LEFT", "RIGHT", "CENTER", "PHOTO"};
     private static final String[] BUTTON_LABELS = {"上键", "下键", "左键", "右键", "中键", "第六键"};
-    private static final String[] ACTION_LABELS = {"后退", "前进", "上一条字幕", "下一条字幕", "播放 / 暂停", "点赞", "不执行"};
+    private static final String[] ACTION_LABELS = {"后退", "前进", "上一条字幕", "下一条字幕", "播放 / 暂停", "开关转写文稿", "不执行", "点赞"};
     private static final String PREFS = "mapper";
     private static final String CONFIG_KEY = "profiles_json";
-    private static final String LIKE_DEFAULT_MIGRATED = "like_default_migrated_v1";
+    private static final String PHOTO_TRANSCRIPT_MIGRATED = "photo_transcript_toggle_migrated_v1";
+    private static final String ADAPTIVE_CAPTIONS_MIGRATED = "adaptive_caption_seconds_migrated_v2";
+    private static final String CONFIG_BEFORE_ADAPTIVE_V2 = "profiles_json_before_caption_seconds_v2";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ButtonEditor[] editors = new ButtonEditor[6];
@@ -217,7 +220,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         add(configCard, profileRow, 10, 4);
         emptyConfig = text("还没有 App 配置，点击“添加 App”开始设置。", 15, MUTED);
         add(configCard, emptyConfig, 6, 6);
-        configHint = text("上下 5 秒，左右 10 秒；第六键默认点赞。点赞先适配 YouTube。", 13, MUTED);
+        configHint = text("字幕动作在文稿打开时切换句子，关闭时按所设秒数跳转。YouTube 中键设为播放 / 暂停时，双击可点赞。", 13, MUTED);
         add(configCard, configHint, 2, 12);
         editorGroup = vertical();
         configCard.addView(editorGroup);
@@ -378,26 +381,30 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             } catch (JSONException impossible) { throw new IllegalStateException(impossible); }
             toast("已载入默认配置，请检查后保存");
         }
-        if (!getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(LIKE_DEFAULT_MIGRATED, false)) {
-            // Upgrade the previously unassigned sixth key once; leave custom actions untouched.
-            for (int i = 0; i < profiles.length(); i++) {
-                JSONObject buttons = profiles.optJSONObject(i).optJSONObject("buttons");
-                JSONObject photo = buttons == null ? null : buttons.optJSONObject("PHOTO");
-                if (photo != null && "none".equals(photo.optString("action"))) {
-                    try { buttons.put("PHOTO", new JSONObject().put("action", "like")); }
-                    catch (JSONException impossible) { throw new IllegalStateException(impossible); }
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        boolean updatePhoto = !preferences.getBoolean(PHOTO_TRANSCRIPT_MIGRATED, false);
+        boolean updateCaptions = !preferences.getBoolean(ADAPTIVE_CAPTIONS_MIGRATED, false);
+        if (updatePhoto || updateCaptions) {
+            try {
+                boolean changed = ProfileConfig.migrateYoutubeActions(config, updatePhoto, updateCaptions);
+                SharedPreferences.Editor editor = preferences.edit()
+                        .putBoolean(PHOTO_TRANSCRIPT_MIGRATED, true)
+                        .putBoolean(ADAPTIVE_CAPTIONS_MIGRATED, true);
+                if (changed) {
+                    if (saved != null && !preferences.contains(CONFIG_BEFORE_ADAPTIVE_V2))
+                        editor.putString(CONFIG_BEFORE_ADAPTIVE_V2, saved);
+                    editor.putString(CONFIG_KEY, config.toString());
                 }
-            }
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                    .putString(CONFIG_KEY, config.toString()).putBoolean(LIKE_DEFAULT_MIGRATED, true).apply();
+                editor.apply();
+            } catch (JSONException impossible) { throw new IllegalStateException(impossible); }
         }
     }
 
     private static String defaultConfig() {
         return "{\"version\":1,\"profiles\":[{\"name\":\"YouTube\",\"package\":\"com.google.android.youtube\",\"buttons\":{"
                 + "\"UP\":{\"action\":\"seek\",\"seconds\":-5},\"DOWN\":{\"action\":\"seek\",\"seconds\":5},"
-                + "\"LEFT\":{\"action\":\"seek\",\"seconds\":-10},\"RIGHT\":{\"action\":\"seek\",\"seconds\":10},"
-                + "\"CENTER\":{\"action\":\"toggle\"},\"PHOTO\":{\"action\":\"like\"}}}]}";
+                + "\"LEFT\":{\"action\":\"caption_previous\",\"seconds\":-10},\"RIGHT\":{\"action\":\"caption_next\",\"seconds\":10},"
+                + "\"CENTER\":{\"action\":\"toggle\"},\"PHOTO\":{\"action\":\"transcript_toggle\"}}}]}";
     }
 
     private void renderProfileList(int selected) {
@@ -430,18 +437,22 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             rendering = false;
             return;
         }
-        configHint.setText("字幕跳转仅支持 YouTube，需打开转写文稿。更改后点击保存。");
+        boolean youtube = "com.google.android.youtube".equals(profiles.optJSONObject(profileIndex).optString("package"));
+        configHint.setText(youtube
+                ? "字幕动作：文稿打开时切换句子，关闭时按右侧秒数跳转。中键设为播放 / 暂停时，双击可点赞。更改后点击保存。"
+                : "更改后点击保存。字幕跳转和开关转写文稿目前仅支持 YouTube。");
         JSONObject buttons = profiles.optJSONObject(profileIndex).optJSONObject("buttons");
         for (int i = 0; i < editors.length; i++) {
             JSONObject value = buttons == null ? null : buttons.optJSONObject(BUTTON_KEYS[i]);
             String action = value == null ? "none" : value.optString("action", "none");
-            int seconds = value == null ? 5 : value.optInt("seconds", 5);
+            int defaultSeconds = "caption_previous".equals(action) ? -10 : "caption_next".equals(action) ? 10 : 5;
+            int seconds = value == null ? defaultSeconds : value.optInt("seconds", defaultSeconds);
             int selection = "seek".equals(action) ? (seconds < 0 ? 0 : 1)
                     : "caption_previous".equals(action) ? 2 : "caption_next".equals(action) ? 3
-                    : "toggle".equals(action) ? 4 : "like".equals(action) ? 5 : 6;
+                    : "toggle".equals(action) ? 4 : "transcript_toggle".equals(action) ? 5 : "like".equals(action) ? 7 : 6;
             editors[i].action.setSelection(selection);
             editors[i].seconds.setText(String.valueOf(Math.max(1, Math.abs(seconds))));
-            editors[i].secondsGroup.setVisibility(selection < 2 ? View.VISIBLE : View.INVISIBLE);
+            editors[i].secondsGroup.setVisibility(selection < 4 ? View.VISIBLE : View.INVISIBLE);
         }
         rendering = false;
     }
@@ -453,7 +464,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             for (int i = 0; i < editors.length; i++) {
                 int action = editors[i].action.getSelectedItemPosition();
                 JSONObject value = new JSONObject();
-                if (action < 2) {
+                if (action < 4) {
                     int seconds;
                     try { seconds = Integer.parseInt(editors[i].seconds.getText().toString().trim()); }
                     catch (NumberFormatException error) { seconds = 0; }
@@ -465,16 +476,21 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
                         }
                         return false;
                     }
-                    value.put("action", "seek");
-                    value.put("seconds", action == 0 ? -seconds : seconds);
-                } else if (action == 2 || action == 3) {
-                    if (!"com.google.android.youtube".equals(
+                    if (action >= 2 && !"com.google.android.youtube".equals(
                             profiles.optJSONObject(profileIndex).optString("package"))) {
                         if (showErrors) toast("字幕行跳转目前仅支持 YouTube");
                         return false;
                     }
-                    value.put("action", action == 2 ? "caption_previous" : "caption_next");
-                } else value.put("action", action == 4 ? "toggle" : action == 5 ? "like" : "none");
+                    value.put("action", action < 2 ? "seek" : action == 2 ? "caption_previous" : "caption_next");
+                    value.put("seconds", action == 0 || action == 2 ? -seconds : seconds);
+                } else if (action == 5) {
+                    if (!"com.google.android.youtube".equals(
+                            profiles.optJSONObject(profileIndex).optString("package"))) {
+                        if (showErrors) toast("开关转写文稿目前仅支持 YouTube");
+                        return false;
+                    }
+                    value.put("action", "transcript_toggle");
+                } else value.put("action", action == 4 ? "toggle" : action == 7 ? "like" : "none");
                 buttons.put(BUTTON_KEYS[i], value);
             }
             profiles.getJSONObject(profileIndex).put("buttons", buttons);
@@ -594,6 +610,12 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             JSONObject profile = new JSONObject(defaultConfig()).getJSONArray("profiles").getJSONObject(0);
             profile.put("name", name);
             profile.put("package", packageName);
+            if (!"com.google.android.youtube".equals(packageName)) {
+                JSONObject buttons = profile.getJSONObject("buttons");
+                buttons.put("LEFT", new JSONObject().put("action", "seek").put("seconds", -10));
+                buttons.put("RIGHT", new JSONObject().put("action", "seek").put("seconds", 10));
+                buttons.put("PHOTO", new JSONObject().put("action", "none"));
+            }
             profiles.put(profile);
             renderProfileList(profiles.length() - 1);
             configHint.setText("已添加 App，设置好按键后点击保存。");
@@ -641,7 +663,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             root.addView(secondsGroup, new LinearLayout.LayoutParams(dp(63), -2));
             action.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
                 @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                    secondsGroup.setVisibility(position < 2 ? View.VISIBLE : View.INVISIBLE);
+                    secondsGroup.setVisibility(position < 4 ? View.VISIBLE : View.INVISIBLE);
                     markDirty();
                 }
                 @Override public void onNothingSelected(AdapterView<?> parent) { }
