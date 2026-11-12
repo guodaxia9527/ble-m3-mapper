@@ -207,7 +207,7 @@
 
 ## 0.1.0 初始验证
 
-设备：realme GT Neo2 / RMX3370，Android 13，ARM64；官方 YouTube 21.43.523。
+验证设备：realme GT Neo2（Android 13，ARM64）；测试时 YouTube 版本 21.43.523。
 
 已通过：
 
@@ -232,7 +232,7 @@
 本机最初被厂商权限监控拦截 Shizuku 授权，用户明确同意后打开了“禁止权限监控”。
 该设置和 USB 默认模式是系统设置，不包含在 APK 权限列表里。
 
-无线启动后续验证：首次故障页面显示 `SSLV3_ALERT_CERTIFICATE_UNKNOWN`，
+无线调试启动需要按 Shizuku 应用提示完成配对。曾遇到配对认证错误，重新配对后恢复。
 当时系统无线调试列表只有电脑记录；允许 Shizuku 通知后开始配对排查。
 下一次继续时已存在 `shizuku` 配对记录，无线调试关闭。通过系统 UI 重新开启，
 点击 Shizuku 自身“启动”按钮，日志出现 `Service started`，管理界面显示“正在运行”。

@@ -1,6 +1,8 @@
 # BLE-M3 遥控映射
 
-用于这台真我 GT Neo2（RMX3370，Android 13）和已测试的 BLE-M3。
+作者：GPT6-Astra
+
+针对 Android 13 与 BLE-M3 开发；目前在 realme GT Neo2 上完成实机验证。
 手机端 App 位于 `android-app/`（包名 `com.guodaxia.blem3mapper`，0.1.15-test），
 使用 Shizuku 在手机上完成按键识别和媒体控制。电脑联机原型仍保留在 `tools/`。
 手机端首次授权、启动和双接口接管已通过；此前版本用户已确认连接 USB 和拔线后按键都正常。
@@ -52,15 +54,9 @@
 1. 在系统蓝牙连接 BLE-M3。
 2. 安装并启动[官方 Shizuku](https://shizuku.rikka.app/download/)，在本 App 授权。
    Android 11+ 可用无线调试启动；每次手机重启后需再次启动 Shizuku。
-   首次启动通过 USB 完成。后续已在手机确认 `shizuku` 配对记录，
-   从 Shizuku 的“通过无线调试启动”按钮成功启动服务，无需电脑执行启动命令。
-   无线调试关闭时先重新开启；配对记录存在且有效时不需要再次配对。
-3. 真我 RMX3370 的授权检查被“权限监控”拦截。本次经用户同意，在开发者选项
-   打开了“禁止权限监控”（原为关闭）。这是系统范围的 ADB 权限设置，
-   不是本 App 的无障碍权限；不用本方案时可恢复原设置。
-4. 本机 USB 文件传输模式下，拔线会结束 Shizuku。已将默认 USB 改为“不传输数据”，
-   当前为仅充电后重新启动 Shizuku，用户确认拔线后仍可控制。
-   日后如切换文件传输导致 Shizuku 停止，需要回到仅充电模式再启动。
+   首次配对后，可从 Shizuku 应用通过无线调试启动；每次重启手机后需重新启动服务。
+3. 某些厂商系统可能限制 Shizuku 的 ADB 权限；请参考 Shizuku 针对设备的说明。
+4. 电脑 USB 启动方式可能受手机 USB 模式影响；日常使用建议通过 Shizuku 无线调试启动。
 5. 本 App 点击“开始使用”，允许通知可显示运行状态和停止按钮。
 6. 打开 YouTube 视频，播放几秒使媒体会话就绪，再使用遥控器；正常操作无需电脑。
 
@@ -76,11 +72,7 @@ Shizuku 提供输入接管及媒体控制权限。字幕跳转复用映射期间
 2. 打开 Shizuku，点“通过无线调试启动”下的“启动”，等到显示“正在运行”。
 3. 回到“遥控映射”，点“开始使用”，再打开 YouTube。
 
-如果出现 `SSLV3_ALERT_CERTIFICATE_UNKNOWN`，表示无线 ADB 的身份认证失败，
-应检查无线调试的“已配对设备”里是否有有效的 `shizuku` 记录，必要时重新配对。
-首次配对需要允许 Shizuku 通知，通过其通知输入系统显示的六位配对码。
-本次曾观察到只有电脑配对、没有 Shizuku 配对；再次继续时已有 Shizuku 记录，
-但无线调试关闭。重新开启后两次手机无线启动成功。
+首次配对时，请在系统无线调试页面按 Shizuku 的提示完成配对，并允许 Shizuku 通知。
 
 当前版本需要分别安装 Shizuku 和遥控映射。Shizuku API 依赖仅为客户端，
 单 APK 需要另行整合无线 ADB 配对、激活及本应用专用的高权限后台；
@@ -151,8 +143,8 @@ Shizuku UserService 使用内部 Android 初始化接口，仅在 shell 身份�
 启用手机 USB 调试、授权电脑、在手机系统蓝牙中连接遥控器，然后打开并暂停一段 YouTube 视频。
 
 ```powershell
-.\tools\build_and_deploy.ps1 -Serial fcba9896
-python .\tools\run_bridge.py --adb "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" --serial fcba9896 --seconds 300
+.\tools\build_and_deploy.ps1 -Serial DEVICE_SERIAL
+python .\tools\run_bridge.py --adb "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" --serial DEVICE_SERIAL --seconds 300
 ```
 
 输出 `BRIDGE_READY` 后按键。日志保存在 `logs/`，记录识别动作、请求位置和实际位置。
