@@ -14,6 +14,7 @@ import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -370,13 +371,15 @@ public final class MapperUserService extends IMapperService.Stub {
                     handleAction(run, media, profile, button);
                 } else if (line.value.startsWith("LISTENER_READY")) {
                     run.connected = true;
-                    status(run, "已接管 BLE-M3 · " + run.profile);
+                    status(run, "已接管遥控器 · " + run.profile);
                 } else if (line.value.startsWith("WAITING_FOR_DEVICE") ||
                         line.value.startsWith("DEVICE_DISCONNECTED") ||
                         line.value.startsWith("DEVICE_READ_INTERRUPTED")) {
                     centerClicks.cancel();
                     run.connected = false;
-                    status(run, "等待 BLE-M3 连接或唤醒 · " + run.profile);
+                    status(run, line.value.contains("multiple_supported_remotes")
+                            ? "检测到多个已启用遥控器，请在设备管理中停用一个 · " + run.profile
+                            : "等待遥控器连接或唤醒 · " + run.profile);
                 } else if (line.value.startsWith("GRAB_FAILED")) {
                     run.connected = false;
                     Log.w(TAG, line.value);
@@ -441,11 +444,40 @@ public final class MapperUserService extends IMapperService.Stub {
     private void startCapture(Run run) throws Exception {
         if (run.stopping) return;
         run.lines.clear();
-        Process child = new ProcessBuilder(run.capturePath, "--listen", "--seconds", "0")
-                .redirectErrorStream(true).start();
+        ArrayList<String> command = new ArrayList<>();
+        command.add(run.capturePath);
+        if (run.config.learnedRemote == null) {
+            command.add("--listen");
+            if (!run.config.bleM3Enabled) command.add("--disable-ble-m3");
+            if (!run.config.beautyR1Enabled) command.add("--disable-beauty-r1");
+        } else {
+            ProfileConfig.LearnedRemote remote = run.config.learnedRemote;
+            if ("keys".equals(remote.protocol)) {
+                command.add("--listen-keys");
+                command.add("--device");
+                command.add(remote.deviceName);
+                for (String button : ProfileConfig.BUTTONS) {
+                    command.add("--key-" + button.toLowerCase(java.util.Locale.ROOT));
+                    command.add(String.valueOf(remote.keyCodes.get(button)));
+                }
+            } else {
+                command.add("--listen-gesture");
+                command.add("--device");
+                command.add(remote.deviceName);
+                if (!remote.consumerName.isEmpty()) {
+                    command.add("--consumer");
+                    command.add(remote.consumerName);
+                }
+                command.add("--protocol");
+                command.add("auto");
+            }
+        }
+        command.add("--seconds");
+        command.add("0");
+        Process child = new ProcessBuilder(command).redirectErrorStream(true).start();
         run.capture = child;
         if (run.stopping) { terminate(child); return; }
-        status(run, "正在连接 BLE-M3 · " + run.profile);
+        status(run, "正在连接遥控器 · " + run.profile);
         Thread reader = new Thread(() -> {
             try (BufferedReader input = new BufferedReader(new InputStreamReader(
                     child.getInputStream(), StandardCharsets.UTF_8))) {

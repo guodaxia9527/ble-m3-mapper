@@ -35,10 +35,31 @@ final class ProfileConfig {
         }
     }
 
-    final Map<String, Profile> profiles;
+    static final class LearnedRemote {
+        final String deviceName;
+        final String consumerName;
+        final String protocol;
+        final Map<String, Integer> keyCodes;
 
-    private ProfileConfig(Map<String, Profile> profiles) {
+        LearnedRemote(String deviceName, String consumerName, String protocol, Map<String, Integer> keyCodes) {
+            this.deviceName = deviceName;
+            this.consumerName = consumerName;
+            this.protocol = protocol;
+            this.keyCodes = keyCodes == null ? Collections.emptyMap() : Collections.unmodifiableMap(keyCodes);
+        }
+    }
+
+    final Map<String, Profile> profiles;
+    final LearnedRemote learnedRemote;
+    final boolean bleM3Enabled;
+    final boolean beautyR1Enabled;
+
+    private ProfileConfig(Map<String, Profile> profiles, LearnedRemote learnedRemote,
+                          boolean bleM3Enabled, boolean beautyR1Enabled) {
         this.profiles = Collections.unmodifiableMap(profiles);
+        this.learnedRemote = learnedRemote;
+        this.bleM3Enabled = bleM3Enabled;
+        this.beautyR1Enabled = beautyR1Enabled;
     }
 
     static ProfileConfig parse(String json) throws Exception {
@@ -91,7 +112,43 @@ final class ProfileConfig {
             }
             profiles.put(packageName, new Profile(name, packageName, actions));
         }
-        return new ProfileConfig(profiles);
+        LearnedRemote learnedRemote = null;
+        JSONObject remote = root.optJSONObject("learnedRemote");
+        if (remote != null) {
+            String deviceName = remote.optString("deviceName", "").trim();
+            if (deviceName.isEmpty() || deviceName.length() > 255)
+                throw new IllegalArgumentException("学习到的遥控器名称无效");
+            String protocol = remote.optString("protocol", "keys");
+            String consumerName = remote.optString("consumerName", "").trim();
+            if (consumerName.length() > 255) throw new IllegalArgumentException("消费控制接口名称过长");
+            if ("relative".equals(protocol) || "absolute".equals(protocol)) protocol = "gesture";
+            if ("gesture".equals(protocol) && (consumerName.isEmpty() || consumerName.equals(deviceName))) {
+                consumerName = deviceName.endsWith(" Mouse")
+                        ? deviceName.substring(0, deviceName.length() - 6) + " Consumer Control"
+                        : deviceName + " Consumer Control";
+            }
+            Map<String, Integer> keys = null;
+            if ("keys".equals(protocol)) {
+                JSONObject keyMap = remote.getJSONObject("keys");
+                if (keyMap.length() != BUTTONS.length)
+                    throw new IllegalArgumentException("学习配置需要完整记录六个按键");
+                keys = new LinkedHashMap<>();
+                java.util.HashSet<Integer> uniqueCodes = new java.util.HashSet<>();
+                for (String button : BUTTONS) {
+                    int code = integer(keyMap, button);
+                    if (code < 1 || code > 767 || !uniqueCodes.add(code))
+                        throw new IllegalArgumentException("学习到的 Linux 按键码无效或重复");
+                    keys.put(button, code);
+                }
+            } else if (!"gesture".equals(protocol)) {
+                throw new IllegalArgumentException("不支持的遥控器输入协议");
+            }
+            learnedRemote = new LearnedRemote(deviceName, consumerName, protocol, keys);
+        }
+        JSONObject builtIn = root.optJSONObject("builtInRemotes");
+        boolean bleM3Enabled = builtIn == null || builtIn.optBoolean("bleM3", true);
+        boolean beautyR1Enabled = builtIn == null || builtIn.optBoolean("beautyR1", true);
+        return new ProfileConfig(profiles, learnedRemote, bleM3Enabled, beautyR1Enabled);
     }
 
     /** Upgrade only the YouTube defaults covered by this feature; retain custom seconds and other apps. */

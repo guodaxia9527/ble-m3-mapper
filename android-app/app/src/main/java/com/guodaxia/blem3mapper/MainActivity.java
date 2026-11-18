@@ -20,6 +20,9 @@ import android.text.TextWatcher;
 import android.text.Editable;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.InputDevice;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.widget.AdapterView;
@@ -29,6 +32,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -78,9 +82,21 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
     private Button saveButton;
     private Button addAppButton;
     private Button deleteButton;
+    private Button learnRemoteButton;
+    private Switch bleM3Switch;
+    private Switch beautyR1Switch;
     private Spinner profileSpinner;
     private LinearLayout editorGroup;
     private TextView emptyConfig;
+    private AlertDialog remoteLearningDialog;
+    private TextView remoteLearningProgress;
+    private int remoteLearningIndex;
+    private String remoteLearningDeviceName;
+    private String remoteLearningProtocol;
+    private String remoteLearningConsumerName;
+    private boolean remoteMotionPressed;
+    private final int[] remoteLearningCodes = new int[6];
+    private final Runnable finishRemoteGestureLearning = () -> saveLearnedRemote();
 
     private final Runnable poll = new Runnable() {
         @Override public void run() {
@@ -169,7 +185,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         runningStatus.setBackground(round(Color.rgb(237, 240, 247), 12));
         heading.addView(runningStatus);
         statusCard.addView(heading);
-        detailStatus = text("连接 BLE-M3 后，点击开始使用", 15, MUTED);
+        detailStatus = text("连接蓝牙遥控器后，点击开始使用", 15, MUTED);
         add(statusCard, detailStatus, 12, 12);
         LinearLayout controls = horizontal();
         startButton = button("开始使用", true);
@@ -222,6 +238,22 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         add(configCard, emptyConfig, 6, 6);
         configHint = text("字幕动作在文稿打开时切换句子，关闭时按所设秒数跳转。YouTube 中键设为播放 / 暂停时，双击可点赞。", 13, MUTED);
         add(configCard, configHint, 2, 12);
+        TextView remoteHint = text("内置支持 BLE-M3 与 Beauty-R1。学习到的自定义遥控器会单独接管；移除后恢复内置设备。", 13, MUTED);
+        add(configCard, remoteHint, 8, 4);
+        JSONObject builtIn = config.optJSONObject("builtInRemotes");
+        bleM3Switch = new Switch(this);
+        bleM3Switch.setText("启用 BLE-M3 内置配置");
+        bleM3Switch.setChecked(builtIn == null || builtIn.optBoolean("bleM3", true));
+        configCard.addView(bleM3Switch);
+        beautyR1Switch = new Switch(this);
+        beautyR1Switch.setText("启用 Beauty-R1 内置配置");
+        beautyR1Switch.setChecked(builtIn == null || builtIn.optBoolean("beautyR1", true));
+        configCard.addView(beautyR1Switch);
+        bleM3Switch.setOnCheckedChangeListener((button, checked) -> updateBuiltInRemote("bleM3", checked));
+        beautyR1Switch.setOnCheckedChangeListener((button, checked) -> updateBuiltInRemote("beautyR1", checked));
+        learnRemoteButton = button("学习新遥控器", false);
+        add(configCard, learnRemoteButton, 4, 8);
+        learnRemoteButton.setOnClickListener(view -> startRemoteLearning());
         editorGroup = vertical();
         configCard.addView(editorGroup);
         for (int i = 0; i < editors.length; i++) {
@@ -273,8 +305,13 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         boolean granted = mapper.hasPermission();
         boolean running = mapper.isRunning();
         boolean hasProfiles = profiles.length() > 0;
+        JSONObject builtIn = config.optJSONObject("builtInRemotes");
+        boolean bleEnabled = builtIn == null || builtIn.optBoolean("bleM3", true);
+        boolean beautyEnabled = builtIn == null || builtIn.optBoolean("beautyR1", true);
+        boolean hasLearnedRemote = config.optJSONObject("learnedRemote") != null;
         String nextState = ready + ":" + granted + ":" + running + ":" + busy + ":"
-                + hasProfiles + ":" + hasSelectedProfile();
+                + hasProfiles + ":" + hasSelectedProfile() + ":" + bleEnabled + ":"
+                + beautyEnabled + ":" + hasLearnedRemote;
         if (nextState.equals(connectionUiState)) return;
         connectionUiState = nextState;
         shizukuStatus.setText(!ready ? "尚未启动" : granted ? "已连接 · 已授权" : "已启动 · 等待授权");
@@ -291,7 +328,237 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         saveButton.setEnabled(!busy && hasProfiles);
         deleteButton.setEnabled(!busy && hasSelectedProfile());
         addAppButton.setEnabled(!busy);
+        learnRemoteButton.setEnabled(!busy && !running);
+        learnRemoteButton.setText(hasLearnedRemote ? "管理已学习的遥控器" : "学习新遥控器");
+        bleM3Switch.setEnabled(!busy && !hasLearnedRemote);
+        beautyR1Switch.setEnabled(!busy && !hasLearnedRemote);
+        rendering = true;
+        bleM3Switch.setChecked(bleEnabled);
+        beautyR1Switch.setChecked(beautyEnabled);
+        rendering = false;
         profileSpinner.setEnabled(!busy && hasProfiles);
+    }
+
+    private void updateBuiltInRemote(String key, boolean enabled) {
+        if (rendering || !persistConfig()) return;
+        try {
+            JSONObject builtIn = config.optJSONObject("builtInRemotes");
+            if (builtIn == null) builtIn = new JSONObject();
+            builtIn.put(key, enabled);
+            config.put("builtInRemotes", builtIn);
+            if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).commit()) {
+                builtIn.put(key, !enabled);
+                config.put("builtInRemotes", builtIn);
+                rendering = true;
+                if ("bleM3".equals(key)) bleM3Switch.setChecked(!enabled);
+                else beautyR1Switch.setChecked(!enabled);
+                rendering = false;
+                showError("遥控器设置未能保存，请重试。");
+                return;
+            }
+            updateConnectionState();
+            if (mapper.isRunning()) applyMapping(true);
+        } catch (JSONException error) {
+            showError("遥控器设置未能保存，请重试。");
+        }
+    }
+
+    private void startRemoteLearning() {
+        if (busy || mapper.isRunning()) {
+            showError("请先停止按键映射，再学习新遥控器。");
+            return;
+        }
+        if (!persistConfig()) return;
+        JSONObject existing = config.optJSONObject("learnedRemote");
+        if (existing != null) {
+            new AlertDialog.Builder(this).setTitle("已学习的遥控器")
+                    .setMessage(existing.optString("deviceName") + "\n可重新学习，或移除后继续使用内置遥控器。")
+                    .setPositiveButton("重新学习", (dialog, which) -> showRemoteLearningDialog())
+                    .setNeutralButton("移除", (dialog, which) -> removeLearnedRemote())
+                    .setNegativeButton("取消", null).show();
+        } else {
+            showRemoteLearningDialog();
+        }
+    }
+
+    private void showRemoteLearningDialog() {
+        remoteLearningIndex = 0;
+        remoteLearningDeviceName = null;
+        remoteLearningProtocol = null;
+        remoteLearningConsumerName = null;
+        remoteMotionPressed = false;
+        handler.removeCallbacks(finishRemoteGestureLearning);
+        java.util.Arrays.fill(remoteLearningCodes, 0);
+        LinearLayout body = vertical();
+        body.setPadding(dp(22), dp(8), dp(22), dp(4));
+        body.addView(text("请确认遥控器已通过蓝牙连接。本次支持安卓识别为键盘/媒体键、相对鼠标手势或触摸坐标的设备。", 14, MUTED));
+        remoteLearningProgress = text("准备好后依次按：上、下、左、右、中、第六键。", 16, INK);
+        add(body, remoteLearningProgress, 14, 4);
+        remoteLearningDialog = new AlertDialog.Builder(this).setTitle("学习新遥控器")
+                .setView(body).setPositiveButton("开始学习", null)
+                .setNegativeButton("取消", (dialog, which) -> remoteLearningDialog = null).create();
+        remoteLearningDialog.setCanceledOnTouchOutside(false);
+        remoteLearningDialog.setOnShowListener(ignored -> remoteLearningDialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(view -> {
+                    remoteLearningIndex = 0;
+                    remoteLearningDeviceName = null;
+                    remoteLearningProtocol = null;
+                    remoteLearningConsumerName = null;
+                    remoteMotionPressed = false;
+                    java.util.Arrays.fill(remoteLearningCodes, 0);
+                    remoteLearningProgress.setText("现在按上键（1/6）");
+                    remoteLearningDialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+                    remoteLearningDialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(false);
+                    Toast.makeText(this, "开始学习，请按上键", Toast.LENGTH_SHORT).show();
+                }));
+        remoteLearningDialog.setOnKeyListener((dialog, keyCode, event) -> {
+            if (keyCode == KeyEvent.KEYCODE_BACK) return false;
+            if (remoteLearningIndex == 0 && remoteLearningProgress.getText().toString().startsWith("准备好"))
+                return false;
+            if (event.getAction() != KeyEvent.ACTION_DOWN) return true;
+            if (event.getRepeatCount() != 0) return true;
+            InputDevice device = InputDevice.getDevice(event.getDeviceId());
+            int scanCode = event.getScanCode();
+            if (device == null || !device.isExternal()) return true;
+            if (remoteLearningProtocol != null && !"keys".equals(remoteLearningProtocol)) {
+                if (remoteLearningIndex >= 5 && (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
+                        || event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+                    remoteLearningConsumerName = normalizeConsumerName(device.getName());
+                    remoteLearningProgress.setText("已识别第六键的媒体接口。继续按第六键完成学习（6/6）");
+                }
+                return true;
+            }
+            if (scanCode <= 0) {
+                remoteLearningProgress.setText("安卓没有提供可学习的硬件键码。请改用鼠标手势/触摸型遥控器，或标准键盘键。");
+                return true;
+            }
+            String name = device.getName();
+            if (remoteLearningProtocol == null) remoteLearningProtocol = "keys";
+            if (remoteLearningDeviceName == null) remoteLearningDeviceName = name;
+            if (!remoteLearningDeviceName.equals(name)) {
+                Toast.makeText(this, "请六次都使用同一个遥控器", Toast.LENGTH_SHORT).show();
+                return true;
+            }
+            for (int i = 0; i < remoteLearningIndex; i++) {
+                if (remoteLearningCodes[i] == scanCode) {
+                    Toast.makeText(this, "这个键码已用于前面的按键，请按正确的下一键", Toast.LENGTH_SHORT).show();
+                    return true;
+                }
+            }
+            remoteLearningCodes[remoteLearningIndex] = scanCode;
+            remoteLearningIndex++;
+            if (remoteLearningIndex < remoteLearningCodes.length) {
+                remoteLearningProgress.setText("已记录 " + BUTTON_LABELS[remoteLearningIndex - 1]
+                        + "。现在按" + BUTTON_LABELS[remoteLearningIndex] + "（" + (remoteLearningIndex + 1) + "/6）");
+                return true;
+            }
+            saveLearnedRemote();
+            return true;
+        });
+        remoteLearningDialog.show();
+        remoteLearningDialog.getWindow().setLayout(-1, -1);
+        View dialogDecor = remoteLearningDialog.getWindow().getDecorView();
+        dialogDecor.setOnTouchListener((view, event) -> captureRemoteGesture(event));
+        dialogDecor.setOnGenericMotionListener((view, event) -> captureRemoteGesture(event));
+    }
+
+    private boolean captureRemoteGesture(MotionEvent event) {
+        if (remoteLearningDialog == null || remoteLearningIndex == 0
+                && remoteLearningProgress.getText().toString().startsWith("准备好")) return false;
+        InputDevice device = InputDevice.getDevice(event.getDeviceId());
+        if (device == null || !device.isExternal()) return false;
+        int source = event.getSource();
+        String protocol;
+        boolean mouseSource = (source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE;
+        if ((source & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
+                || mouseSource) protocol = "gesture";
+        else return false;
+        if (remoteLearningProtocol != null && !"keys".equals(remoteLearningProtocol)
+                && !remoteLearningProtocol.equals(protocol)) return true;
+        if (remoteLearningProtocol == null) remoteLearningProtocol = protocol;
+        if ("keys".equals(remoteLearningProtocol)) return true;
+        String name = normalizeGestureDeviceName(device.getName(), mouseSource);
+        if (remoteLearningDeviceName == null) remoteLearningDeviceName = name;
+        if (!remoteLearningDeviceName.equals(name)) {
+            Toast.makeText(this, "请六次都使用同一个遥控器", Toast.LENGTH_SHORT).show();
+            return true;
+        }
+        int action = event.getActionMasked();
+        boolean pressed = action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_BUTTON_PRESS;
+        boolean released = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_BUTTON_RELEASE;
+        if (pressed) remoteMotionPressed = true;
+        if (released && remoteMotionPressed && remoteLearningIndex < BUTTON_LABELS.length) {
+            remoteMotionPressed = false;
+            remoteLearningIndex++;
+            if (remoteLearningIndex < BUTTON_LABELS.length) {
+                remoteLearningProgress.setText("已记录 " + BUTTON_LABELS[remoteLearningIndex - 1]
+                        + "。现在按" + BUTTON_LABELS[remoteLearningIndex] + "（" + (remoteLearningIndex + 1) + "/6）");
+            } else {
+                remoteLearningProgress.setText("六键已记录，正在确认是否还有单独的第六键接口…");
+                handler.postDelayed(finishRemoteGestureLearning, 250);
+            }
+        }
+        return true;
+    }
+
+    private void saveLearnedRemote() {
+        handler.removeCallbacks(finishRemoteGestureLearning);
+        try {
+            JSONObject learned = new JSONObject().put("deviceName", remoteLearningDeviceName)
+                    .put("protocol", remoteLearningProtocol);
+            if (remoteLearningConsumerName != null) {
+                learned.put("consumerName", remoteLearningConsumerName);
+            } else if ("gesture".equals(remoteLearningProtocol)) {
+                learned.put("consumerName", normalizeConsumerName(remoteLearningDeviceName));
+            }
+            if ("keys".equals(remoteLearningProtocol)) {
+                JSONObject keys = new JSONObject();
+                for (int i = 0; i < BUTTON_KEYS.length; i++) keys.put(BUTTON_KEYS[i], remoteLearningCodes[i]);
+                learned.put("keys", keys);
+            }
+            config.put("learnedRemote", learned);
+            if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).commit()) {
+                showError("学习结果未能保存，请重试。");
+                return;
+            }
+            remoteLearningProgress.setText("六个按键已学习完成：" + remoteLearningDeviceName);
+            Toast.makeText(this, "遥控器学习完成", Toast.LENGTH_SHORT).show();
+            remoteLearningDialog.dismiss();
+            remoteLearningDialog = null;
+            updateConnectionState();
+        } catch (JSONException error) {
+            showError("无法保存学习结果，请重试。");
+        }
+    }
+
+    private String normalizeConsumerName(String androidDeviceName) {
+        if (androidDeviceName == null || androidDeviceName.isEmpty())
+            return remoteLearningDeviceName + " Consumer Control";
+        if (androidDeviceName.endsWith(" Consumer Control")) return androidDeviceName;
+        if (androidDeviceName.equals(remoteLearningDeviceName)) {
+            return remoteLearningDeviceName.endsWith(" Mouse")
+                    ? remoteLearningDeviceName.substring(0, remoteLearningDeviceName.length() - 6) + " Consumer Control"
+                    : remoteLearningDeviceName + " Consumer Control";
+        }
+        return androidDeviceName + " Consumer Control";
+    }
+
+    private static String normalizeGestureDeviceName(String androidName, boolean mouseSource) {
+        if (androidName != null && androidName.endsWith(" Consumer Control")) {
+            String base = androidName.substring(0, androidName.length() - " Consumer Control".length());
+            return mouseSource ? base + " Mouse" : base;
+        }
+        return androidName;
+    }
+
+    private void removeLearnedRemote() {
+        config.remove("learnedRemote");
+        if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).commit()) {
+            showError("无法移除学习配置，请重试。");
+            return;
+        }
+        updateConnectionState();
+        toast("已移除学习配置，BLE-M3 和 Beauty-R1 内置支持仍可使用");
     }
 
     private static void setTextIfChanged(TextView view, String value) {
