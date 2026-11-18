@@ -43,10 +43,12 @@ public final class MapperUserService extends IMapperService.Stub {
 
     private static final class Line {
         final Process process;
+        final String remoteId;
         final String value;
         final long receivedAt;
-        Line(Process process, String value) {
+        Line(Process process, String remoteId, String value) {
             this.process = process;
+            this.remoteId = remoteId;
             this.value = value;
             this.receivedAt = SystemClock.elapsedRealtime();
         }
@@ -82,7 +84,9 @@ public final class MapperUserService extends IMapperService.Stub {
         volatile String foreground = "";
         volatile String profile = "";
         volatile String message = "正在启动";
-        volatile Process capture;
+        final java.util.concurrent.ConcurrentHashMap<String, Process> captures = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.concurrent.ConcurrentHashMap<String, Long> retryRemotes = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.Set<Process> readyCaptures = java.util.concurrent.ConcurrentHashMap.newKeySet();
         volatile Process focusProcess;
         volatile String readerFailure;
         long nextAutomationAttempt;
@@ -165,7 +169,7 @@ public final class MapperUserService extends IMapperService.Stub {
         // Do this before waiting for a lifecycle lock or a binder call to return.
         run.stopping = true;
         run.connected = false;
-        terminate(run.capture);
+        stopCapture(run);
         terminate(run.focusProcess);
         if (run.worker != null) run.worker.interrupt();
         synchronized (lifecycle) {
@@ -185,6 +189,7 @@ public final class MapperUserService extends IMapperService.Stub {
             try {
                 ProfileConfig config = ProfileConfig.parse(configJson);
                 if (config.profiles.isEmpty()) throw new IllegalArgumentException("请先添加一个应用配置");
+                if (config.remotes.isEmpty()) throw new IllegalArgumentException("请至少启用一台遥控器");
                 String verifiedPath = verifyCapturePath(capturePath);
                 if (!stopCurrent()) throw new IllegalStateException("上一次映射还在停止，请稍后重试");
                 run = new Run(verifiedPath, config);
@@ -230,7 +235,7 @@ public final class MapperUserService extends IMapperService.Stub {
         if (run == null) return true;
         run.stopping = true;
         run.connected = false;
-        terminate(run.capture);
+        stopCapture(run);
         terminate(run.focusProcess);
         if (run.worker != null) {
             run.worker.interrupt();
@@ -238,7 +243,7 @@ public final class MapperUserService extends IMapperService.Stub {
             catch (InterruptedException error) { Thread.currentThread().interrupt(); }
             if (run.worker.isAlive()) return false;
         }
-        if (run.capture != null && run.capture.isAlive()) return false;
+        for (Process child : run.captures.values()) if (child.isAlive()) return false;
         if (run.ownership != null) run.ownership.close();
         active = null;
         log("映射已停止，遥控器已释放");
@@ -297,7 +302,7 @@ public final class MapperUserService extends IMapperService.Stub {
                     String desired = focus.availablePackage();
                     ProfileConfig.Profile profile = run.config.profiles.get(desired);
                     if (profile == null) {
-                        if (run.capture != null) stopCapture(run);
+                        if (!run.captures.isEmpty()) stopCapture(run);
                         capturePackage = "";
                         run.profile = "";
                         if (!focus.valid) status(run, "无法确认当前应用，已暂时释放遥控器");
@@ -320,20 +325,22 @@ public final class MapperUserService extends IMapperService.Stub {
                             capturePackage = desired;
                             run.retryAfter = 0;
                         }
-                        if (run.capture == null && now >= run.retryAfter) startCapture(run);
+                        startCapture(run);
                     }
                     nextFocus = SystemClock.elapsedRealtime() + 500;
                 }
                 if (run.readerFailure != null) throw new IllegalStateException(run.readerFailure);
                 long pollMs = centerClicks.pollMillis(SystemClock.elapsedRealtime(), 50);
                 Line line = run.lines.poll(pollMs, TimeUnit.MILLISECONDS);
-                if (line == null || line.process != run.capture) continue;
+                if (line == null || !run.captures.containsValue(line.process)) continue;
                 if (line.value == null) {
-                    centerClicks.cancel();
                     int exit = line.process.isAlive() ? -1 : line.process.exitValue();
-                    stopCapture(run);
-                    run.retryAfter = SystemClock.elapsedRealtime() + 2500;
-                    status(run, "接管暂时中断，正在重试（" + exit + "）");
+                    centerClicks.cancel();
+                    run.captures.remove(line.remoteId, line.process);
+                    run.readyCaptures.remove(line.process);
+                    run.connected = !run.readyCaptures.isEmpty();
+                    run.retryRemotes.put(line.remoteId, SystemClock.elapsedRealtime() + 2500);
+                    status(run, "一台遥控器暂时断开，正在单独重连（" + exit + "）");
                     continue;
                 }
                 Matcher action = ACTION.matcher(line.value);
@@ -370,16 +377,18 @@ public final class MapperUserService extends IMapperService.Stub {
                     }
                     handleAction(run, media, profile, button);
                 } else if (line.value.startsWith("LISTENER_READY")) {
+                    run.readyCaptures.add(line.process);
                     run.connected = true;
-                    status(run, "已接管遥控器 · " + run.profile);
+                    status(run, "已接管 " + run.readyCaptures.size() + " 台遥控器 · " + run.profile);
                 } else if (line.value.startsWith("WAITING_FOR_DEVICE") ||
                         line.value.startsWith("DEVICE_DISCONNECTED") ||
                         line.value.startsWith("DEVICE_READ_INTERRUPTED")) {
-                    centerClicks.cancel();
-                    run.connected = false;
-                    status(run, line.value.contains("multiple_supported_remotes")
-                            ? "检测到多个已启用遥控器，请在设备管理中停用一个 · " + run.profile
-                            : "等待遥控器连接或唤醒 · " + run.profile);
+                    if (line.value.startsWith("WAITING_FOR_DEVICE")) {
+                        run.readyCaptures.remove(line.process);
+                        run.connected = !run.readyCaptures.isEmpty();
+                        status(run, run.connected ? "已接管 " + run.readyCaptures.size() + " 台，等待其他遥控器 · " + run.profile
+                                : "等待已启用的遥控器连接或唤醒 · " + run.profile);
+                    }
                 } else if (line.value.startsWith("GRAB_FAILED")) {
                     run.connected = false;
                     Log.w(TAG, line.value);
@@ -419,7 +428,7 @@ public final class MapperUserService extends IMapperService.Stub {
                                      CenterClickTracker.Click<PendingCenter> click,
                                      String capturePackage) throws InterruptedException {
         PendingCenter pending = click.context;
-        if (run.stopping || pending.process != run.capture || !pending.packageName.equals(capturePackage)) return;
+        if (run.stopping || !run.captures.containsValue(pending.process) || !pending.packageName.equals(capturePackage)) return;
         Focus focus = readFocus(run);
         if (run.stopping) return;
         updateFocus(run, focus);
@@ -443,15 +452,27 @@ public final class MapperUserService extends IMapperService.Stub {
 
     private void startCapture(Run run) throws Exception {
         if (run.stopping) return;
-        run.lines.clear();
-        ArrayList<String> command = new ArrayList<>();
-        command.add(run.capturePath);
-        if (run.config.learnedRemote == null) {
-            command.add("--listen");
-            if (!run.config.bleM3Enabled) command.add("--disable-ble-m3");
-            if (!run.config.beautyR1Enabled) command.add("--disable-beauty-r1");
-        } else {
-            ProfileConfig.LearnedRemote remote = run.config.learnedRemote;
+        boolean startedAny = false;
+        java.util.HashSet<String> started = new java.util.HashSet<>();
+        for (ProfileConfig.LearnedRemote remote : run.config.remotes) {
+            String identity = remote.deviceName + "\n" + remote.consumerName;
+            if (!started.add(identity)) {
+                log("跳过重复遥控器配置：" + remote.deviceName);
+                continue;
+            }
+            if (run.captures.containsKey(remote.id)
+                    || SystemClock.elapsedRealtime() < run.retryRemotes.getOrDefault(remote.id, 0L)) continue;
+            startRemoteCapture(run, remote);
+            startedAny = true;
+        }
+        if (startedAny) status(run, "正在连接 " + run.captures.size() + " 台已启用遥控器 · " + run.profile);
+        else if (run.captures.isEmpty()) status(run, "没有可连接的已启用遥控器 · " + run.profile);
+    }
+
+    private void startRemoteCapture(Run run, ProfileConfig.LearnedRemote remote) throws Exception {
+            if (run.stopping) return;
+            ArrayList<String> command = new ArrayList<>();
+            command.add(run.capturePath);
             if ("keys".equals(remote.protocol)) {
                 command.add("--listen-keys");
                 command.add("--device");
@@ -471,45 +492,43 @@ public final class MapperUserService extends IMapperService.Stub {
                 command.add("--protocol");
                 command.add("auto");
             }
-        }
-        command.add("--seconds");
-        command.add("0");
-        Process child = new ProcessBuilder(command).redirectErrorStream(true).start();
-        run.capture = child;
-        if (run.stopping) { terminate(child); return; }
-        status(run, "正在连接遥控器 · " + run.profile);
-        Thread reader = new Thread(() -> {
-            try (BufferedReader input = new BufferedReader(new InputStreamReader(
-                    child.getInputStream(), StandardCharsets.UTF_8))) {
-                String value;
-                while (!run.stopping && (value = input.readLine()) != null) {
-                    boolean offered;
-                    synchronized (run.lines) {
-                        offered = run.lines.offer(new Line(child, value));
+            command.add("--seconds");
+            command.add("0");
+            Process child = new ProcessBuilder(command).redirectErrorStream(true).start();
+            Process previous = run.captures.putIfAbsent(remote.id, child);
+            if (previous != null) { terminate(child); return; }
+            if (run.stopping) { terminate(child); return; }
+            Thread reader = new Thread(() -> {
+                try (BufferedReader input = new BufferedReader(new InputStreamReader(
+                        child.getInputStream(), StandardCharsets.UTF_8))) {
+                    String value;
+                    while (!run.stopping && (value = input.readLine()) != null) {
+                        boolean offered;
+                        synchronized (run.lines) { offered = run.lines.offer(new Line(child, remote.id, value)); }
+                        if (!offered) {
+                            run.readerFailure = "按键事件积压，已停止接管，请重新开始";
+                            terminate(child);
+                            break;
+                        }
                     }
-                    if (!offered) {
-                        run.readerFailure = "按键事件积压，已停止接管，请重新开始";
-                        terminate(child);
-                        break;
-                    }
+                } catch (Exception error) {
+                    if (!run.stopping && run.captures.containsValue(child)) Log.w(TAG, "Capture reader stopped", error);
+                } finally {
+                    synchronized (run.lines) { run.lines.offer(new Line(child, remote.id, null)); }
                 }
-            } catch (Exception error) {
-                if (!run.stopping && run.capture == child) Log.w(TAG, "Capture reader stopped", error);
-            } finally {
-                synchronized (run.lines) {
-                    run.lines.offer(new Line(child, null));
-                }
-            }
-        }, "ble-mapper-input");
-        reader.setDaemon(true);
-        reader.start();
+            }, "ble-mapper-input-" + remote.id);
+            reader.setDaemon(true);
+            reader.start();
     }
 
     private static boolean stopCapture(Run run) {
-        Process child = run.capture;
         run.connected = false;
-        boolean stopped = terminate(child);
-        if (stopped && run.capture == child) run.capture = null;
+        boolean stopped = true;
+        for (Process child : new ArrayList<>(run.captures.values())) stopped &= terminate(child);
+        if (stopped) {
+            run.captures.clear();
+            run.readyCaptures.clear();
+        }
         run.lines.clear();
         return stopped;
     }

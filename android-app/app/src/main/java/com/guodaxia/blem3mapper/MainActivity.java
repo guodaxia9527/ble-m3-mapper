@@ -28,6 +28,7 @@ import android.view.WindowInsets;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -83,8 +84,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
     private Button addAppButton;
     private Button deleteButton;
     private Button learnRemoteButton;
-    private Switch bleM3Switch;
-    private Switch beautyR1Switch;
+    private LinearLayout remoteListGroup;
     private Spinner profileSpinner;
     private LinearLayout editorGroup;
     private TextView emptyConfig;
@@ -238,22 +238,14 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         add(configCard, emptyConfig, 6, 6);
         configHint = text("字幕动作在文稿打开时切换句子，关闭时按所设秒数跳转。YouTube 中键设为播放 / 暂停时，双击可点赞。", 13, MUTED);
         add(configCard, configHint, 2, 12);
-        TextView remoteHint = text("内置支持 BLE-M3 与 Beauty-R1。学习到的自定义遥控器会单独接管；移除后恢复内置设备。", 13, MUTED);
+        TextView remoteHint = text("内置与学习到的遥控器平级管理。可同时启用多台设备；每台设备使用自己的按键学习配置。", 13, MUTED);
         add(configCard, remoteHint, 8, 4);
-        JSONObject builtIn = config.optJSONObject("builtInRemotes");
-        bleM3Switch = new Switch(this);
-        bleM3Switch.setText("启用 BLE-M3 内置配置");
-        bleM3Switch.setChecked(builtIn == null || builtIn.optBoolean("bleM3", true));
-        configCard.addView(bleM3Switch);
-        beautyR1Switch = new Switch(this);
-        beautyR1Switch.setText("启用 Beauty-R1 内置配置");
-        beautyR1Switch.setChecked(builtIn == null || builtIn.optBoolean("beautyR1", true));
-        configCard.addView(beautyR1Switch);
-        bleM3Switch.setOnCheckedChangeListener((button, checked) -> updateBuiltInRemote("bleM3", checked));
-        beautyR1Switch.setOnCheckedChangeListener((button, checked) -> updateBuiltInRemote("beautyR1", checked));
-        learnRemoteButton = button("学习新遥控器", false);
+        remoteListGroup = vertical();
+        configCard.addView(remoteListGroup);
+        learnRemoteButton = button("添加遥控器", false);
         add(configCard, learnRemoteButton, 4, 8);
         learnRemoteButton.setOnClickListener(view -> startRemoteLearning());
+        renderRemoteList();
         editorGroup = vertical();
         configCard.addView(editorGroup);
         for (int i = 0; i < editors.length; i++) {
@@ -305,13 +297,10 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         boolean granted = mapper.hasPermission();
         boolean running = mapper.isRunning();
         boolean hasProfiles = profiles.length() > 0;
-        JSONObject builtIn = config.optJSONObject("builtInRemotes");
-        boolean bleEnabled = builtIn == null || builtIn.optBoolean("bleM3", true);
-        boolean beautyEnabled = builtIn == null || builtIn.optBoolean("beautyR1", true);
-        boolean hasLearnedRemote = config.optJSONObject("learnedRemote") != null;
+        JSONArray remotes = config.optJSONArray("remotes");
+        int remoteCount = remotes == null ? 0 : remotes.length();
         String nextState = ready + ":" + granted + ":" + running + ":" + busy + ":"
-                + hasProfiles + ":" + hasSelectedProfile() + ":" + bleEnabled + ":"
-                + beautyEnabled + ":" + hasLearnedRemote;
+                + hasProfiles + ":" + hasSelectedProfile() + ":" + remoteCount;
         if (nextState.equals(connectionUiState)) return;
         connectionUiState = nextState;
         shizukuStatus.setText(!ready ? "尚未启动" : granted ? "已连接 · 已授权" : "已启动 · 等待授权");
@@ -329,38 +318,123 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         deleteButton.setEnabled(!busy && hasSelectedProfile());
         addAppButton.setEnabled(!busy);
         learnRemoteButton.setEnabled(!busy && !running);
-        learnRemoteButton.setText(hasLearnedRemote ? "管理已学习的遥控器" : "学习新遥控器");
-        bleM3Switch.setEnabled(!busy && !hasLearnedRemote);
-        beautyR1Switch.setEnabled(!busy && !hasLearnedRemote);
-        rendering = true;
-        bleM3Switch.setChecked(bleEnabled);
-        beautyR1Switch.setChecked(beautyEnabled);
-        rendering = false;
+        learnRemoteButton.setText("添加遥控器");
+        renderRemoteList();
         profileSpinner.setEnabled(!busy && hasProfiles);
     }
 
-    private void updateBuiltInRemote(String key, boolean enabled) {
-        if (rendering || !persistConfig()) return;
-        try {
-            JSONObject builtIn = config.optJSONObject("builtInRemotes");
-            if (builtIn == null) builtIn = new JSONObject();
-            builtIn.put(key, enabled);
-            config.put("builtInRemotes", builtIn);
-            if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).commit()) {
-                builtIn.put(key, !enabled);
-                config.put("builtInRemotes", builtIn);
-                rendering = true;
-                if ("bleM3".equals(key)) bleM3Switch.setChecked(!enabled);
-                else beautyR1Switch.setChecked(!enabled);
-                rendering = false;
-                showError("遥控器设置未能保存，请重试。");
-                return;
+    private JSONArray remoteArray() {
+        JSONArray remotes = config.optJSONArray("remotes");
+        if (remotes != null) {
+            boolean changed = ensureBuiltInEntry(remotes, "builtin-ble-m3", "BLE-M3", "BLE-M3 Mouse", "BLE-M3 Consumer Control");
+            changed |= ensureBuiltInEntry(remotes, "builtin-beauty-r1", "Beauty-R1", "Beauty-R1", "Beauty-R1 Consumer Control");
+            if (changed) {
+                try { config.put("remotes", remotes); }
+                catch (JSONException ignored) { }
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).apply();
             }
-            updateConnectionState();
-            if (mapper.isRunning()) applyMapping(true);
-        } catch (JSONException error) {
-            showError("遥控器设置未能保存，请重试。");
+            return remotes;
         }
+        remotes = new JSONArray();
+        JSONObject builtIn = config.optJSONObject("builtInRemotes");
+        try {
+            remotes.put(new JSONObject()
+                    .put("id", "builtin-ble-m3").put("type", "builtin").put("deviceName", "BLE-M3 Mouse")
+                    .put("consumerName", "BLE-M3 Consumer Control").put("protocol", "gesture")
+                    .put("enabled", builtIn == null || builtIn.optBoolean("bleM3", true)));
+            remotes.put(new JSONObject()
+                    .put("id", "builtin-beauty-r1").put("type", "builtin").put("deviceName", "Beauty-R1")
+                    .put("consumerName", "Beauty-R1 Consumer Control").put("protocol", "gesture")
+                    .put("enabled", builtIn == null || builtIn.optBoolean("beautyR1", true)));
+            JSONObject old = config.optJSONObject("learnedRemote");
+            if (old != null) {
+                JSONObject migrated = new JSONObject(old.toString());
+                migrated.put("id", "learned-legacy").put("type", "learned").put("enabled", true);
+                remotes.put(migrated);
+            }
+            config.put("remotes", remotes);
+            config.remove("builtInRemotes");
+            config.remove("learnedRemote");
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).apply();
+        } catch (JSONException ignored) { }
+        return remotes;
+    }
+
+    private boolean ensureBuiltInEntry(JSONArray remotes, String id, String label, String deviceName, String consumerName) {
+        for (int i = 0; i < remotes.length(); i++) {
+            JSONObject item = remotes.optJSONObject(i);
+            if (item != null && id.equals(item.optString("id"))) return false;
+        }
+        try {
+            remotes.put(new JSONObject().put("id", id).put("type", "builtin").put("label", label)
+                    .put("deviceName", deviceName).put("consumerName", consumerName)
+                    .put("protocol", "gesture").put("enabled", true));
+            return true;
+        } catch (JSONException ignored) { return false; }
+    }
+
+    private void renderRemoteList() {
+        if (remoteListGroup == null) return;
+        remoteListGroup.removeAllViews();
+        JSONArray remotes = remoteArray();
+        for (int i = 0; i < remotes.length(); i++) {
+            JSONObject remote = remotes.optJSONObject(i);
+            if (remote == null) continue;
+            final String id = remote.optString("id");
+            final boolean learned = "learned".equals(remote.optString("type"));
+            LinearLayout row = horizontal();
+            CheckBox enabled = new CheckBox(this);
+            enabled.setText(remote.optString("label", remote.optString("deviceName", "遥控器"))
+                    + (learned ? " · 已学习" : " · 内置"));
+            enabled.setTextColor(INK);
+            enabled.setChecked(remote.optBoolean("enabled", true));
+            enabled.setEnabled(!busy && !mapper.isRunning());
+            enabled.setOnCheckedChangeListener((button, checked) -> {
+                try {
+                    JSONObject current = findRemote(id);
+                    if (current == null) return;
+                    current.put("enabled", checked);
+                    persistRemoteArray();
+                    if (mapper.isRunning()) applyMapping(true);
+                } catch (JSONException error) { showError("遥控器设置未能保存，请重试。"); }
+            });
+            row.addView(enabled, new LinearLayout.LayoutParams(0, dp(48), 1));
+            if (learned) {
+                Button remove = button("删除", false);
+                remove.setTextColor(Color.rgb(176, 52, 63));
+                remove.setEnabled(!busy && !mapper.isRunning());
+                remove.setOnClickListener(view -> removeRemote(id));
+                row.addView(remove, new LinearLayout.LayoutParams(dp(72), dp(42)));
+            }
+            remoteListGroup.addView(row);
+        }
+    }
+
+    private JSONObject findRemote(String id) {
+        JSONArray remotes = remoteArray();
+        for (int i = 0; i < remotes.length(); i++) {
+            JSONObject item = remotes.optJSONObject(i);
+            if (item != null && id.equals(item.optString("id"))) return item;
+        }
+        return null;
+    }
+
+    private void persistRemoteArray() {
+        try { config.put("remotes", remoteArray()); } catch (JSONException ignored) { }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).apply();
+        updateConnectionState();
+    }
+
+    private void removeRemote(String id) {
+        JSONArray old = remoteArray();
+        JSONArray next = new JSONArray();
+        for (int i = 0; i < old.length(); i++) {
+            JSONObject item = old.optJSONObject(i);
+            if (item == null || !id.equals(item.optString("id"))) next.put(item);
+        }
+        try { config.put("remotes", next); } catch (JSONException ignored) { }
+        persistRemoteArray();
+        toast("已删除学习配置");
     }
 
     private void startRemoteLearning() {
@@ -368,17 +442,12 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             showError("请先停止按键映射，再学习新遥控器。");
             return;
         }
-        if (!persistConfig()) return;
-        JSONObject existing = config.optJSONObject("learnedRemote");
-        if (existing != null) {
-            new AlertDialog.Builder(this).setTitle("已学习的遥控器")
-                    .setMessage(existing.optString("deviceName") + "\n可重新学习，或移除后继续使用内置遥控器。")
-                    .setPositiveButton("重新学习", (dialog, which) -> showRemoteLearningDialog())
-                    .setNeutralButton("移除", (dialog, which) -> removeLearnedRemote())
-                    .setNegativeButton("取消", null).show();
-        } else {
-            showRemoteLearningDialog();
+        if (remoteArray().length() >= 16) {
+            showError("最多保存 16 台遥控器配置；请先删除不用的条目。");
+            return;
         }
+        if (!persistConfig()) return;
+        showRemoteLearningDialog();
     }
 
     private void showRemoteLearningDialog() {
@@ -504,7 +573,9 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
     private void saveLearnedRemote() {
         handler.removeCallbacks(finishRemoteGestureLearning);
         try {
-            JSONObject learned = new JSONObject().put("deviceName", remoteLearningDeviceName)
+            JSONObject learned = new JSONObject().put("id", "learned-" + java.util.UUID.randomUUID())
+                    .put("type", "learned").put("enabled", true)
+                    .put("label", remoteLearningDeviceName).put("deviceName", remoteLearningDeviceName)
                     .put("protocol", remoteLearningProtocol);
             if (remoteLearningConsumerName != null) {
                 learned.put("consumerName", remoteLearningConsumerName);
@@ -516,7 +587,9 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
                 for (int i = 0; i < BUTTON_KEYS.length; i++) keys.put(BUTTON_KEYS[i], remoteLearningCodes[i]);
                 learned.put("keys", keys);
             }
-            config.put("learnedRemote", learned);
+            remoteArray().put(learned);
+            config.put("remotes", remoteArray());
+            config.remove("learnedRemote");
             if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).commit()) {
                 showError("学习结果未能保存，请重试。");
                 return;
@@ -549,16 +622,6 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             return mouseSource ? base + " Mouse" : base;
         }
         return androidName;
-    }
-
-    private void removeLearnedRemote() {
-        config.remove("learnedRemote");
-        if (!getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).commit()) {
-            showError("无法移除学习配置，请重试。");
-            return;
-        }
-        updateConnectionState();
-        toast("已移除学习配置，BLE-M3 和 Beauty-R1 内置支持仍可使用");
     }
 
     private static void setTextIfChanged(TextView view, String value) {

@@ -7,6 +7,8 @@ import org.json.JSONObject;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
 
 /** Immutable, validated configuration received through the app's private binder. */
 final class ProfileConfig {
@@ -36,12 +38,14 @@ final class ProfileConfig {
     }
 
     static final class LearnedRemote {
+        final String id;
         final String deviceName;
         final String consumerName;
         final String protocol;
         final Map<String, Integer> keyCodes;
 
-        LearnedRemote(String deviceName, String consumerName, String protocol, Map<String, Integer> keyCodes) {
+        LearnedRemote(String id, String deviceName, String consumerName, String protocol, Map<String, Integer> keyCodes) {
+            this.id = id;
             this.deviceName = deviceName;
             this.consumerName = consumerName;
             this.protocol = protocol;
@@ -50,16 +54,11 @@ final class ProfileConfig {
     }
 
     final Map<String, Profile> profiles;
-    final LearnedRemote learnedRemote;
-    final boolean bleM3Enabled;
-    final boolean beautyR1Enabled;
+    final List<LearnedRemote> remotes;
 
-    private ProfileConfig(Map<String, Profile> profiles, LearnedRemote learnedRemote,
-                          boolean bleM3Enabled, boolean beautyR1Enabled) {
+    private ProfileConfig(Map<String, Profile> profiles, List<LearnedRemote> remotes) {
         this.profiles = Collections.unmodifiableMap(profiles);
-        this.learnedRemote = learnedRemote;
-        this.bleM3Enabled = bleM3Enabled;
-        this.beautyR1Enabled = beautyR1Enabled;
+        this.remotes = Collections.unmodifiableList(remotes);
     }
 
     static ProfileConfig parse(String json) throws Exception {
@@ -112,9 +111,31 @@ final class ProfileConfig {
             }
             profiles.put(packageName, new Profile(name, packageName, actions));
         }
-        LearnedRemote learnedRemote = null;
-        JSONObject remote = root.optJSONObject("learnedRemote");
-        if (remote != null) {
+        JSONArray remoteArray = root.optJSONArray("remotes");
+        List<LearnedRemote> remotes = new ArrayList<>();
+        if (remoteArray != null) {
+            if (remoteArray.length() > 16) throw new IllegalArgumentException("最多支持 16 台遥控器");
+            java.util.HashSet<String> remoteIds = new java.util.HashSet<>();
+            for (int i = 0; i < remoteArray.length(); i++) {
+                JSONObject remote = remoteArray.getJSONObject(i);
+                String id = remote.optString("id", "learned-" + i).trim();
+                if (id.isEmpty() || !remoteIds.add(id)) throw new IllegalArgumentException("遥控器配置编号为空或重复");
+                if (!remote.optBoolean("enabled", true)) continue;
+                remotes.add(parseRemote(remote, id));
+            }
+        } else {
+            JSONObject builtIn = root.optJSONObject("builtInRemotes");
+            if (builtIn == null || builtIn.optBoolean("bleM3", true))
+                remotes.add(new LearnedRemote("builtin-ble-m3", "BLE-M3 Mouse", "BLE-M3 Consumer Control", "gesture", null));
+            if (builtIn == null || builtIn.optBoolean("beautyR1", true))
+                remotes.add(new LearnedRemote("builtin-beauty-r1", "Beauty-R1", "Beauty-R1 Consumer Control", "gesture", null));
+            JSONObject legacy = root.optJSONObject("learnedRemote");
+            if (legacy != null) remotes.add(parseRemote(legacy, "learned-legacy"));
+        }
+        return new ProfileConfig(profiles, remotes);
+    }
+
+    private static LearnedRemote parseRemote(JSONObject remote, String id) throws Exception {
             String deviceName = remote.optString("deviceName", "").trim();
             if (deviceName.isEmpty() || deviceName.length() > 255)
                 throw new IllegalArgumentException("学习到的遥控器名称无效");
@@ -143,12 +164,7 @@ final class ProfileConfig {
             } else if (!"gesture".equals(protocol)) {
                 throw new IllegalArgumentException("不支持的遥控器输入协议");
             }
-            learnedRemote = new LearnedRemote(deviceName, consumerName, protocol, keys);
-        }
-        JSONObject builtIn = root.optJSONObject("builtInRemotes");
-        boolean bleM3Enabled = builtIn == null || builtIn.optBoolean("bleM3", true);
-        boolean beautyR1Enabled = builtIn == null || builtIn.optBoolean("beautyR1", true);
-        return new ProfileConfig(profiles, learnedRemote, bleM3Enabled, beautyR1Enabled);
+            return new LearnedRemote(id, deviceName, consumerName, protocol, keys);
     }
 
     /** Upgrade only the YouTube defaults covered by this feature; retain custom seconds and other apps. */
