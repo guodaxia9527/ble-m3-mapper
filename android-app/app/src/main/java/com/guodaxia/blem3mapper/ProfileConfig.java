@@ -55,10 +55,15 @@ final class ProfileConfig {
 
     final Map<String, Profile> profiles;
     final List<LearnedRemote> remotes;
+    final boolean highlightTranscript;
+    final boolean loopTranscriptLine;
 
-    private ProfileConfig(Map<String, Profile> profiles, List<LearnedRemote> remotes) {
+    private ProfileConfig(Map<String, Profile> profiles, List<LearnedRemote> remotes,
+                          boolean highlightTranscript, boolean loopTranscriptLine) {
         this.profiles = Collections.unmodifiableMap(profiles);
         this.remotes = Collections.unmodifiableList(remotes);
+        this.highlightTranscript = highlightTranscript;
+        this.loopTranscriptLine = loopTranscriptLine;
     }
 
     static ProfileConfig parse(String json) throws Exception {
@@ -132,7 +137,8 @@ final class ProfileConfig {
             JSONObject legacy = root.optJSONObject("learnedRemote");
             if (legacy != null) remotes.add(parseRemote(legacy, "learned-legacy"));
         }
-        return new ProfileConfig(profiles, remotes);
+        return new ProfileConfig(profiles, remotes, root.optBoolean("highlightTranscript", false),
+                root.optBoolean("loopTranscriptLine", false));
     }
 
     private static LearnedRemote parseRemote(JSONObject remote, String id) throws Exception {

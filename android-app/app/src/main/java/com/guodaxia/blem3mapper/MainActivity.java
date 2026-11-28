@@ -75,6 +75,8 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
     private TextView shizukuStatus;
     private TextView runningStatus;
     private TextView detailStatus;
+    private TextView highlightStatus;
+    private Button overlayPermissionButton;
     private TextView configHint;
     private TextView logText;
     private Button permissionButton;
@@ -134,6 +136,11 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         visible = false;
         handler.removeCallbacks(poll);
         super.onStop();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        updateHighlightPermission();
     }
 
     @Override protected void onDestroy() {
@@ -198,6 +205,52 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         startButton.setOnClickListener(view -> startMapping());
         stopButton.setOnClickListener(view -> stopMapping());
 
+        Switch highlight = new Switch(this);
+        highlight.setText("高亮 YouTube 转写文稿当前行");
+        highlight.setChecked(config.optBoolean("highlightTranscript"));
+        add(statusCard, highlight, 12, 0);
+        highlightStatus = text("", 13, MUTED);
+        add(statusCard, highlightStatus, 6, 0);
+        overlayPermissionButton = button("去授权", false);
+        add(statusCard, overlayPermissionButton, 6, 0);
+        overlayPermissionButton.setOnClickListener(view -> openOverlaySettings());
+        updateHighlightPermission();
+        highlight.setOnCheckedChangeListener((view, enabled) -> {
+            try {
+                config.put("highlightTranscript", enabled);
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).apply();
+            } catch (JSONException error) {
+                showError("无法保存文稿高亮设置");
+                return;
+            }
+            updateHighlightPermission();
+            if (mapper.isRunning()) applyMapping(true);
+            if (enabled && !android.provider.Settings.canDrawOverlays(this)) {
+                new AlertDialog.Builder(this)
+                        .setTitle("允许显示高亮描边")
+                        .setMessage("请在系统设置中选择「遥控映射」，打开「显示在其他应用上层」，然后返回此应用。")
+                        .setPositiveButton("打开系统设置", (dialog, which) -> openOverlaySettings())
+                        .setNegativeButton("稍后", null)
+                        .show();
+            }
+        });
+        Switch sentenceLoop = new Switch(this);
+        sentenceLoop.setText("打开文稿时按句循环");
+        sentenceLoop.setChecked(config.optBoolean("loopTranscriptLine"));
+        add(statusCard, sentenceLoop, 8, 0);
+        sentenceLoop.setOnCheckedChangeListener((view, enabled) -> {
+            try {
+                config.put("loopTranscriptLine", enabled);
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(CONFIG_KEY, config.toString()).apply();
+                if (mapper.isRunning()) applyMapping(true);
+            } catch (JSONException error) {
+                showError("无法保存循环设置");
+            }
+        });
+        Button shortcutGuide = button("YouTube 遥控器按键速查", false);
+        add(statusCard, shortcutGuide, 8, 0);
+        shortcutGuide.setOnClickListener(view -> showShortcutGuide());
+
         LinearLayout permissionCard = card(content);
         LinearLayout permissionRow = horizontal();
         LinearLayout permissionTexts = vertical();
@@ -236,7 +289,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         add(configCard, profileRow, 10, 4);
         emptyConfig = text("还没有 App 配置，点击“添加 App”开始设置。", 15, MUTED);
         add(configCard, emptyConfig, 6, 6);
-        configHint = text("字幕动作在文稿打开时切换句子，关闭时按所设秒数跳转。YouTube 中键设为播放 / 暂停时，双击可点赞。", 13, MUTED);
+        configHint = text("YouTube 暂停时，左右键三击跳首尾。中键设为播放 / 暂停时，先跳转并播放一段，暂停后双击循环，三击点赞。", 13, MUTED);
         add(configCard, configHint, 2, 12);
         TextView remoteHint = text("内置与学习到的遥控器平级管理。可同时启用多台设备；每台设备使用自己的按键学习配置。", 13, MUTED);
         add(configCard, remoteHint, 8, 4);
@@ -628,6 +681,56 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         if (!TextUtils.equals(view.getText(), value)) view.setText(value);
     }
 
+    private void updateHighlightPermission() {
+        if (highlightStatus == null) return;
+        boolean enabled = config.optBoolean("highlightTranscript");
+        boolean authorized = android.provider.Settings.canDrawOverlays(this);
+        highlightStatus.setVisibility(enabled ? View.VISIBLE : View.GONE);
+        overlayPermissionButton.setVisibility(enabled && !authorized ? View.VISIBLE : View.GONE);
+        highlightStatus.setText(authorized ? "已授权。启动映射后打开 YouTube 转写文稿。"
+                : "等待授权。在系统设置中允许遥控映射显示在其他应用上层。");
+    }
+
+    private void showShortcutGuide() {
+        String[][] shortcuts = {
+                {"上／下单击", "后退／前进 5 秒"},
+                {"左／右单击", "文稿打开时跳上一句／下一句，否则后退／前进 10 秒"},
+                {"左／右三击", "暂停时跳到开头／结束前约 1.5 秒"},
+                {"中键单击", "播放／暂停。循环中单击会退出并暂停"},
+                {"中键双击", "暂停时开始循环。自由循环需先遥控跳转、播放一段再暂停"},
+                {"中键三击", "点赞"},
+                {"第六键单击", "打开／关闭转写文稿"}
+        };
+        LinearLayout rows = vertical();
+        rows.setPadding(dp(22), dp(8), dp(22), dp(8));
+        add(rows, text("以下为默认按键。单击动作和秒数可在配置中调整。", 13, MUTED), 0, 8);
+        for (String[] shortcut : shortcuts) {
+            LinearLayout row = horizontal();
+            row.setGravity(Gravity.TOP);
+            row.addView(text(shortcut[0], 14, INK), new LinearLayout.LayoutParams(dp(106), -2));
+            row.addView(text(shortcut[1], 14, MUTED), new LinearLayout.LayoutParams(0, -2, 1));
+            add(rows, row, 8, 0);
+        }
+        add(rows, text("开启按句循环并打开文稿后，暂停时双击会循环当前句。", 13, MUTED), 12, 0);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(rows);
+        new AlertDialog.Builder(this).setTitle("YouTube 默认按键")
+                .setView(scroll).setPositiveButton("知道了", null).show();
+    }
+
+    private void openOverlaySettings() {
+        String action = android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION;
+        try {
+            startActivity(new Intent(action, Uri.parse("package:" + getPackageName())));
+        } catch (android.content.ActivityNotFoundException | SecurityException error) {
+            try {
+                startActivity(new Intent(action));
+            } catch (android.content.ActivityNotFoundException | SecurityException unavailable) {
+                showError("请手动打开系统设置，搜索「显示在其他应用上层」，并为遥控映射开启。");
+            }
+        }
+    }
+
     private void startMapping() {
         if (profiles.length() == 0) {
             toast("请先添加一个 App 配置");
@@ -712,6 +815,9 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
             toast("已载入默认配置，请检查后保存");
         }
         SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        boolean removedPreview = config.remove("timedCaptionDemo") != null;
+        removedPreview |= config.remove("timedCaptionVtt") != null;
+        if (removedPreview) preferences.edit().putString(CONFIG_KEY, config.toString()).apply();
         boolean updatePhoto = !preferences.getBoolean(PHOTO_TRANSCRIPT_MIGRATED, false);
         boolean updateCaptions = !preferences.getBoolean(ADAPTIVE_CAPTIONS_MIGRATED, false);
         if (updatePhoto || updateCaptions) {
@@ -769,7 +875,7 @@ public final class MainActivity extends Activity implements MapperConnection.Lis
         }
         boolean youtube = "com.google.android.youtube".equals(profiles.optJSONObject(profileIndex).optString("package"));
         configHint.setText(youtube
-                ? "字幕动作：文稿打开时切换句子，关闭时按右侧秒数跳转。中键设为播放 / 暂停时，双击可点赞。更改后点击保存。"
+                ? "文稿打开时，字幕动作切换句子。关闭时按右侧秒数跳转。暂停时左右键三击跳首尾。中键设为播放 / 暂停时，先跳转并播放一段，暂停后双击循环，三击点赞。更改后点击保存。"
                 : "更改后点击保存。字幕跳转和开关转写文稿目前仅支持 YouTube。");
         JSONObject buttons = profiles.optJSONObject(profileIndex).optJSONObject("buttons");
         for (int i = 0; i < editors.length; i++) {

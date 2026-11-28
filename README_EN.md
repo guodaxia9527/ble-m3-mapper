@@ -7,8 +7,10 @@ Use a Bluetooth remote to control YouTube playback and navigate transcript lines
 ## Features
 
 - With the YouTube transcript open, Left and Right move to the previous or next caption. When it is closed, those buttons seek by the configured number of seconds.
-- Up and Down seek. A single Center press plays or pauses; a quick double press likes the video.
+- Up and Down seek. While paused, triple press Left to go to the start or Right to go near the end.
+- Use the remote to seek, let the video play for at least half a second, and pause. While paused, double press Center to loop the segment. Press Center once to pause and exit the loop. Triple press Center to like the video.
 - The sixth button toggles the transcript panel.
+- Enable the optional transcript highlight and grant Android permission to display over other apps. The outline follows the visible current line in the YouTube transcript.
 - Configure all six actions per app. Multiple remotes can be enabled and used at the same time.
 - Learn additional remotes when Android exposes them as standard external input devices.
 
@@ -40,10 +42,12 @@ No computer connection is needed for normal use. The app does not require an Acc
 | Up / Down | Seek backward / forward 5 seconds |
 | Left / Right | Previous / next transcript line; otherwise seek ±10 seconds |
 | Center, single press | Play / pause |
-| Center, quick double press | Like |
+| Left / Right, triple press while paused | Go to the start / about 1.5 seconds before the end |
+| Center, double press while paused | Loop the segment after a remote seek, or loop the current transcript line with sentence looping enabled and the transcript open |
+| Center, triple press | Like |
 | Sixth button | Toggle transcript |
 
-Actions and seek durations can be changed in the app. Transcript-panel controls depend on YouTube's current interface and may need updates if YouTube changes it.
+The app briefly shows the loop's start and end times. For sentence looping, keep the current line and the next line visible. Actions and seek durations can be changed in the app. Transcript-panel controls depend on YouTube's current interface and may need updates if YouTube changes it.
 
 ## Build
 

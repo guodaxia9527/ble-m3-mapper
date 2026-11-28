@@ -7,11 +7,21 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.provider.Settings;
+import android.view.Gravity;
+import android.view.View;
+import android.view.WindowManager;
 import android.widget.Toast;
+import org.json.JSONObject;
 
 /** Owns the mapping lifetime, with an always available user stop action. */
 public final class MappingForegroundService extends Service {
@@ -30,6 +40,12 @@ public final class MappingForegroundService extends Service {
     private int generation;
     private int latestStartId;
     private String lastMessage = "正在连接控制服务…";
+    private boolean highlightEnabled;
+    private View highlightView;
+    private Rect highlightBounds;
+    private final Runnable expireHighlight = this::hideHighlight;
+    private long lastLoopFeedback;
+    private Toast loopToast;
 
     private final MapperConnection.Listener connectionListener = () -> {
         if (destroyed || stopping || !(starting || started)) return;
@@ -51,7 +67,11 @@ public final class MappingForegroundService extends Service {
                 stopNow(true, null);
                 return;
             }
-            main.postDelayed(() -> update(request), 1500);
+            boolean showHighlight = highlightEnabled && Settings.canDrawOverlays(this);
+            if (showHighlight && snapshot.running) updateHighlight(snapshot.status);
+            else hideHighlight();
+            boolean youtube = updateLoopFeedback(snapshot.status);
+            main.postDelayed(() -> update(request), showHighlight ? 250 : youtube ? 400 : 1000);
         });
     }
 
@@ -79,6 +99,8 @@ public final class MappingForegroundService extends Service {
         started = false;
         cleanupIssued = false;
         main.removeCallbacksAndMessages(null);
+        hideHighlight();
+        hideLoopFeedback();
         int request = ++generation;
         lastMessage = "正在连接控制服务…";
         try {
@@ -94,6 +116,8 @@ public final class MappingForegroundService extends Service {
             stopNow(true, "按键配置不可用，请保存配置后重试");
             return START_NOT_STICKY;
         }
+        try { highlightEnabled = new JSONObject(config).optBoolean("highlightTranscript"); }
+        catch (Exception error) { highlightEnabled = false; }
         main.postDelayed(() -> {
             if (!destroyed && !stopping && starting && request == generation)
                 stopNow(true, "启动超时，请检查 Shizuku 后重试");
@@ -132,6 +156,93 @@ public final class MappingForegroundService extends Service {
         @Override public void onError(String message) { }
     };
 
+    private void updateHighlight(String status) {
+        try {
+            JSONObject sample = new JSONObject(status).optJSONObject("transcriptHighlight");
+            if (sample == null) {
+                hideHighlight();
+                return;
+            }
+            long remaining = 900 - (SystemClock.elapsedRealtime() - sample.getLong("time"));
+            Rect bounds = new Rect(sample.getInt("left"), sample.getInt("top"),
+                    sample.getInt("right"), sample.getInt("bottom"));
+            if (remaining <= 0 || bounds.isEmpty()) {
+                hideHighlight();
+                return;
+            }
+            WindowManager windows = getSystemService(WindowManager.class);
+            if (!bounds.equals(highlightBounds)) {
+                WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                        bounds.width(), bounds.height(), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        PixelFormat.TRANSLUCENT);
+                params.gravity = Gravity.TOP | Gravity.LEFT;
+                if (Build.VERSION.SDK_INT >= 30) params.setFitInsetsTypes(0);
+                params.x = bounds.left;
+                params.y = bounds.top;
+                // Keep touch pass-through on Android 12+ for this single overlay.
+                params.alpha = 0.75f;
+                if (highlightView == null) {
+                    View outline = new View(this);
+                    float density = getResources().getDisplayMetrics().density;
+                    GradientDrawable border = new GradientDrawable();
+                    border.setColor(Color.TRANSPARENT);
+                    border.setStroke(Math.max(1, Math.round(3 * density)), Color.rgb(255, 177, 30));
+                    border.setCornerRadius(6 * density);
+                    outline.setBackground(border);
+                    windows.addView(outline, params);
+                    highlightView = outline;
+                } else {
+                    windows.updateViewLayout(highlightView, params);
+                }
+                highlightBounds = bounds;
+            }
+            main.removeCallbacks(expireHighlight);
+            main.postDelayed(expireHighlight, remaining);
+        } catch (Exception error) {
+            hideHighlight();
+        }
+    }
+
+    private void hideHighlight() {
+        main.removeCallbacks(expireHighlight);
+        if (highlightView != null) {
+            try { getSystemService(WindowManager.class).removeViewImmediate(highlightView); }
+            catch (IllegalArgumentException ignored) { }
+        }
+        highlightView = null;
+        highlightBounds = null;
+    }
+
+    private boolean updateLoopFeedback(String status) {
+        try {
+            JSONObject state = new JSONObject(status);
+            if (!"com.google.android.youtube".equals(state.optString("foreground"))) {
+                hideLoopFeedback();
+                return false;
+            }
+            JSONObject feedback = state.optJSONObject("loopFeedback");
+            if (feedback != null) {
+                long time = feedback.getLong("time");
+                if (time > lastLoopFeedback && SystemClock.elapsedRealtime() - time < 2500) {
+                    lastLoopFeedback = time;
+                    hideLoopFeedback();
+                    loopToast = Toast.makeText(this, feedback.getString("message"), Toast.LENGTH_SHORT);
+                    loopToast.show();
+                }
+            }
+            return true;
+        } catch (Exception error) {
+            return false;
+        }
+    }
+
+    private void hideLoopFeedback() {
+        if (loopToast != null) loopToast.cancel();
+        loopToast = null;
+    }
+
     private void stopNow(boolean preserveStatus, String failure) {
         if (destroyed) return;
         if (stopping) {
@@ -145,6 +256,8 @@ public final class MappingForegroundService extends Service {
         cleanupIssued = true;
         int request = ++generation;
         main.removeCallbacksAndMessages(null);
+        hideHighlight();
+        hideLoopFeedback();
         if (failure != null) connection.reportFailure(failure);
         MapperConnection.Result stopped = new MapperConnection.Result() {
             @Override public void onSuccess(String message) { finishStop(request); }
@@ -165,6 +278,8 @@ public final class MappingForegroundService extends Service {
         stopping = true;
         generation++;
         main.removeCallbacksAndMessages(null);
+        hideHighlight();
+        hideLoopFeedback();
         if (connection != null) {
             connection.removeListener(connectionListener);
             // Normal STOP and failure paths already clean up. Repeating the call

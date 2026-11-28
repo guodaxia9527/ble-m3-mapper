@@ -1,6 +1,7 @@
 package com.guodaxia.blem3mapper;
 
 import android.content.Context;
+import android.graphics.Rect;
 import android.content.pm.ApplicationInfo;
 import android.net.LocalServerSocket;
 import android.os.IBinder;
@@ -26,7 +27,26 @@ import java.util.regex.Pattern;
 public final class MapperUserService extends IMapperService.Stub {
     private static final String PACKAGE = "com.guodaxia.blem3mapper";
     private static final String TAG = "BleMapper";
-    private static final long CENTER_DOUBLE_CLICK_MS = 320;
+    private static final long CLICK_INTERVAL_MS = 320;
+    private static final String YOUTUBE = "com.google.android.youtube";
+
+    private static final class LoopFeedback {
+        final String message;
+        final long time = SystemClock.elapsedRealtime();
+
+        LoopFeedback(String message) {
+            this.message = message;
+        }
+    }
+
+    private static final class TranscriptHighlight {
+        final Rect bounds;
+        final long sampledAt = SystemClock.elapsedRealtime();
+
+        TranscriptHighlight(Rect bounds) {
+            this.bounds = bounds;
+        }
+    }
     private static final Pattern FOCUS = Pattern.compile(
             "mCurrentFocus=Window\\{[^}]*\\s([A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+)/[^}]*\\}");
     private static final Pattern ACTION = Pattern.compile("^ACTION (UP|DOWN|LEFT|RIGHT|CENTER|PHOTO)(?: .*)?$");
@@ -54,12 +74,14 @@ public final class MapperUserService extends IMapperService.Stub {
         }
     }
 
-    private static final class PendingCenter {
+    private static final class PendingButton {
         final Process process;
         final String packageName;
-        PendingCenter(Process process, String packageName) {
+        final String button;
+        PendingButton(Process process, String packageName, String button) {
             this.process = process;
             this.packageName = packageName;
+            this.button = button;
         }
     }
 
@@ -82,6 +104,21 @@ public final class MapperUserService extends IMapperService.Stub {
         volatile boolean stopping;
         volatile boolean connected;
         volatile String foreground = "";
+        volatile TranscriptHighlight transcriptHighlight;
+        volatile LoopFeedback loopFeedback;
+        Rect highlightCandidate;
+        long highlightCandidateSince;
+
+        void updateTranscriptHighlight(Rect bounds) {
+            long now = SystemClock.elapsedRealtime();
+            if (bounds == null || !bounds.equals(highlightCandidate)) {
+                highlightCandidate = bounds;
+                highlightCandidateSince = now;
+                transcriptHighlight = null;
+            } else if (now - highlightCandidateSince >= 350) {
+                transcriptHighlight = new TranscriptHighlight(bounds);
+            }
+        }
         volatile String profile = "";
         volatile String message = "正在启动";
         final java.util.concurrent.ConcurrentHashMap<String, Process> captures = new java.util.concurrent.ConcurrentHashMap<>();
@@ -253,13 +290,26 @@ public final class MapperUserService extends IMapperService.Stub {
     @Override public String getStatus() {
         Run run = active;
         try {
-            return new JSONObject()
+            JSONObject status = new JSONObject()
                     .put("servicePid", android.os.Process.myPid())
                     .put("running", run != null && !run.stopping && run.worker.isAlive())
                     .put("connected", run != null && run.connected && !run.stopping)
                     .put("foreground", run == null ? "" : run.foreground)
                     .put("profile", run == null ? "" : run.profile)
-                    .put("message", run == null || run.stopping ? idleMessage : run.message).toString();
+                    .put("message", run == null || run.stopping ? idleMessage : run.message);
+            TranscriptHighlight highlight = run == null ? null : run.transcriptHighlight;
+            if (highlight != null && !run.stopping && YOUTUBE.equals(run.foreground)) {
+                Rect bounds = highlight.bounds;
+                status.put("transcriptHighlight", new JSONObject().put("time", highlight.sampledAt)
+                        .put("left", bounds.left).put("top", bounds.top)
+                        .put("right", bounds.right).put("bottom", bounds.bottom));
+            }
+            LoopFeedback feedback = run == null ? null : run.loopFeedback;
+            if (feedback != null && !run.stopping && YOUTUBE.equals(run.foreground)) {
+                status.put("loopFeedback", new JSONObject().put("time", feedback.time)
+                        .put("message", feedback.message));
+            }
+            return status.toString();
         } catch (Exception ignored) {
             return "{\"running\":false,\"connected\":false,\"message\":\"状态暂不可用\"}";
         }
@@ -280,26 +330,33 @@ public final class MapperUserService extends IMapperService.Stub {
             media = new MediaControl();
             log("手机端映射已启动；只在已配置的应用中接管遥控器");
             long nextFocus = 0;
+            long nextPlayback = 0;
+            long nextHighlight = 0;
             String capturePackage = "";
-            CenterClickTracker<PendingCenter> centerClicks = new CenterClickTracker<>(CENTER_DOUBLE_CLICK_MS);
+            CenterClickTracker<PendingButton> clicks = new CenterClickTracker<>(CLICK_INTERVAL_MS, 3);
             while (!run.stopping) {
                 long now = SystemClock.elapsedRealtime();
-                CenterClickTracker.Click<PendingCenter> completedCenter;
+                CenterClickTracker.Click<PendingButton> completed;
                 // Serialize the deadline decision with timestamping/enqueueing by the reader.
                 synchronized (run.lines) {
-                    completedCenter = centerClicks.expire(now, !run.lines.isEmpty());
+                    completed = clicks.expire(now, !run.lines.isEmpty());
                 }
-                if (completedCenter != null) {
-                    dispatchCenterClick(run, media, completedCenter, capturePackage);
+                if (completed != null) {
+                    dispatchClick(run, media, completed, capturePackage);
                     nextFocus = 0;
                 }
                 // Foreground polling can take longer than the double-click window. Resolve
                 // buffered gestures first; every resulting action still validates focus below.
-                if (!centerClicks.hasPending() && run.lines.isEmpty() && now >= nextFocus) {
+                if (!clicks.hasPending() && run.lines.isEmpty() && now >= nextFocus) {
                     Focus focus = readFocus(run);
                     if (run.stopping) break;
                     updateFocus(run, focus);
                     String desired = focus.availablePackage();
+                    if (!YOUTUBE.equals(desired)) {
+                        media.clearPlaybackHistory();
+                        run.updateTranscriptHighlight(null);
+                        run.loopFeedback = null;
+                    }
                     ProfileConfig.Profile profile = run.config.profiles.get(desired);
                     if (profile == null) {
                         if (!run.captures.isEmpty()) stopCapture(run);
@@ -310,7 +367,8 @@ public final class MapperUserService extends IMapperService.Stub {
                         else status(run, "等待打开已配置的应用；遥控器保持原有操作");
                     } else {
                         run.profile = profile.name;
-                        if (needsTranscriptAutomation(profile) && !media.isTranscriptAutomationReady()
+                        if ((needsTranscriptAutomation(profile) || (run.config.highlightTranscript && YOUTUBE.equals(desired)))
+                                && !media.isTranscriptAutomationReady()
                                 && now >= run.nextAutomationAttempt) {
                             run.nextAutomationAttempt = now + 5000;
                             try {
@@ -329,13 +387,48 @@ public final class MapperUserService extends IMapperService.Stub {
                     }
                     nextFocus = SystemClock.elapsedRealtime() + 500;
                 }
+                if (run.config.highlightTranscript && YOUTUBE.equals(capturePackage)
+                        && !clicks.hasPending() && run.lines.isEmpty() && now >= nextHighlight) {
+                    try {
+                        run.updateTranscriptHighlight(media.currentTranscriptBounds());
+                    } catch (InterruptedException error) {
+                        throw error;
+                    } catch (Exception error) {
+                        run.updateTranscriptHighlight(null);
+                    }
+                    nextHighlight = SystemClock.elapsedRealtime() + 180;
+                }
+                if (YOUTUBE.equals(capturePackage) && now >= nextPlayback) {
+                    nextPlayback = now + 120;
+                    boolean wasLooping = media.isLooping();
+                    String loopExit = "已退出循环";
+                    if (media.observeYoutubePlayback()) {
+                        Focus focus = readFocus(run);
+                        if (run.stopping) break;
+                        if (!YOUTUBE.equals(focus.availablePackage())) {
+                            media.clearPlaybackHistory();
+                        } else {
+                            try {
+                                media.repeatSegment();
+                            } catch (InterruptedException error) {
+                                throw error;
+                            } catch (Exception error) {
+                                media.clearPlaybackHistory();
+                                loopExit = "循环已停止：" + errorMessage(error);
+                                log("YouTube · " + loopExit);
+                            }
+                        }
+                    }
+                    if (wasLooping && !media.isLooping() && YOUTUBE.equals(run.foreground))
+                        run.loopFeedback = new LoopFeedback(loopExit);
+                }
                 if (run.readerFailure != null) throw new IllegalStateException(run.readerFailure);
-                long pollMs = centerClicks.pollMillis(SystemClock.elapsedRealtime(), 50);
+                long pollMs = clicks.pollMillis(SystemClock.elapsedRealtime(), 50);
                 Line line = run.lines.poll(pollMs, TimeUnit.MILLISECONDS);
                 if (line == null || !run.captures.containsValue(line.process)) continue;
                 if (line.value == null) {
                     int exit = line.process.isAlive() ? -1 : line.process.exitValue();
-                    centerClicks.cancel();
+                    clicks.cancelSource(line.process);
                     run.captures.remove(line.remoteId, line.process);
                     run.readyCaptures.remove(line.process);
                     run.connected = !run.readyCaptures.isEmpty();
@@ -347,21 +440,20 @@ public final class MapperUserService extends IMapperService.Stub {
                 if (action.matches()) {
                     String button = action.group(1);
                     ProfileConfig.Profile capturedProfile = run.config.profiles.get(capturePackage);
-                    if ("CENTER".equals(button) && "com.google.android.youtube".equals(capturePackage)
-                            && capturedProfile != null
-                            && "toggle".equals(capturedProfile.buttons.get("CENTER").kind)) {
-                        completedCenter = centerClicks.press(line.process,
-                                new PendingCenter(line.process, capturePackage), line.receivedAt);
-                        if (completedCenter != null) {
-                            dispatchCenterClick(run, media, completedCenter, capturePackage);
+                    boolean multiClick = "LEFT".equals(button) || "RIGHT".equals(button)
+                            || ("CENTER".equals(button) && capturedProfile != null
+                            && "toggle".equals(capturedProfile.buttons.get("CENTER").kind));
+                    if (YOUTUBE.equals(capturePackage) && multiClick) {
+                        completed = clicks.press(line.process, button,
+                                new PendingButton(line.process, capturePackage, button), line.receivedAt);
+                        if (completed != null) {
+                            dispatchClick(run, media, completed, capturePackage);
                             nextFocus = 0;
                         }
                         continue;
                     }
-                    // A different physical button ends the pair; preserve its order after
-                    // the preceding single center click rather than combining across it.
-                    completedCenter = centerClicks.takeSingle();
-                    if (completedCenter != null) dispatchCenterClick(run, media, completedCenter, capturePackage);
+                    completed = clicks.takeSingle();
+                    if (completed != null) dispatchClick(run, media, completed, capturePackage);
                     // Refresh on each completed physical gesture; do not act on stale foreground data.
                     Focus focus = readFocus(run);
                     if (run.stopping) break;
@@ -371,6 +463,8 @@ public final class MapperUserService extends IMapperService.Stub {
                     if (profile == null || !target.equals(capturePackage)) {
                         log("应用已切换，忽略这次按键并释放遥控器");
                         stopCapture(run);
+                        media.clearPlaybackHistory();
+                        run.updateTranscriptHighlight(null);
                         capturePackage = "";
                         nextFocus = 0;
                         continue;
@@ -383,6 +477,7 @@ public final class MapperUserService extends IMapperService.Stub {
                 } else if (line.value.startsWith("WAITING_FOR_DEVICE") ||
                         line.value.startsWith("DEVICE_DISCONNECTED") ||
                         line.value.startsWith("DEVICE_READ_INTERRUPTED")) {
+                    clicks.cancelSource(line.process);
                     if (line.value.startsWith("WAITING_FOR_DEVICE")) {
                         run.readyCaptures.remove(line.process);
                         run.connected = !run.readyCaptures.isEmpty();
@@ -396,7 +491,7 @@ public final class MapperUserService extends IMapperService.Stub {
                             ? "遥控器正被另一控制服务占用，请停止旧服务后重新开始映射"
                             : "无法接管遥控器，请检查 Shizuku 权限后重新开始映射");
                 } else if (line.value.startsWith("ERROR") || line.value.startsWith("WARNING")) {
-                    if (line.value.startsWith("WARNING input queue overflow")) centerClicks.cancel();
+                    if (line.value.startsWith("WARNING input queue overflow")) clicks.cancelSource(line.process);
                     Log.w(TAG, line.value);
                 }
             }
@@ -424,24 +519,30 @@ public final class MapperUserService extends IMapperService.Stub {
         return false;
     }
 
-    private void dispatchCenterClick(Run run, MediaControl media,
-                                     CenterClickTracker.Click<PendingCenter> click,
-                                     String capturePackage) throws InterruptedException {
-        PendingCenter pending = click.context;
+    private void dispatchClick(Run run, MediaControl media,
+                               CenterClickTracker.Click<PendingButton> click,
+                               String capturePackage) throws InterruptedException {
+        PendingButton pending = click.context;
         if (run.stopping || !run.captures.containsValue(pending.process) || !pending.packageName.equals(capturePackage)) return;
         Focus focus = readFocus(run);
         if (run.stopping) return;
         updateFocus(run, focus);
         if (!pending.packageName.equals(focus.availablePackage())) {
-            log("中键操作已取消：当前应用已切换");
+            media.clearPlaybackHistory();
+            run.updateTranscriptHighlight(null);
+            log("按键操作已取消：当前应用已切换");
             return;
         }
         ProfileConfig.Profile profile = run.config.profiles.get(pending.packageName);
         if (profile == null) return;
-        if (click.doubleClick) {
-            handleAction(run, media, profile, "CENTER", "like");
+        String button = pending.button;
+        if (click.count == 3) {
+            String action = "CENTER".equals(button) ? "like" : "LEFT".equals(button) ? "seek_start" : "seek_end";
+            handleAction(run, media, profile, button, action);
+        } else if (click.count == 2 && "CENTER".equals(button)) {
+            handleAction(run, media, profile, button, "replay");
         } else {
-            handleAction(run, media, profile, "CENTER");
+            for (int i = 0; i < click.count; i++) handleAction(run, media, profile, button);
         }
     }
 
@@ -562,17 +663,28 @@ public final class MapperUserService extends IMapperService.Stub {
                               String forcedKind) throws InterruptedException {
         ProfileConfig.Action configured = profile.buttons.get(button);
         ProfileConfig.Action action = forcedKind == null ? configured : new ProfileConfig.Action(forcedKind, 0);
-        String prefix = "CENTER".equals(button) && "like".equals(forcedKind)
-                ? profile.name + " · 中键双击：" : profile.name + " · " + ProfileConfig.label(button) + "：";
+        String gesture = forcedKind == null ? "" : "replay".equals(forcedKind) ? "双击" : "三击";
+        String prefix = profile.name + " · " + ProfileConfig.label(button) + gesture + "：";
         if ("none".equals(action.kind)) {
             log(prefix + "未分配操作");
             return;
         }
+        boolean wasLooping = media.isLooping();
+        boolean replayRequested = "replay".equals(action.kind);
         try {
             if (run.stopping) return;
-            JSONObject result = media.perform(profile.packageName, action);
+            JSONObject result = media.perform(profile.packageName, action, run.config.loopTranscriptLine);
             String description;
-            if ("seek".equals(action.kind)) {
+            if (replayRequested) {
+                description = result.has("message") ? result.getString("message")
+                        : (result.optBoolean("sentenceLoop") ? "按句循环 " : "循环 ")
+                        + formatCaptionTime(result.getLong("replayStart")) + "–"
+                        + formatCaptionTime(result.getLong("replayEnd"));
+            } else if ("seek_start".equals(action.kind) || "seek_end".equals(action.kind)) {
+                String target = "seek_start".equals(action.kind) ? "开头" : "末尾";
+                description = result.has("message") ? result.getString("message")
+                        : (result.optBoolean("confirmed") ? "已跳到" : "已请求跳到") + target;
+            } else if ("seek".equals(action.kind)) {
                 description = (action.seconds < 0 ? "后退 " : "前进 ") + Math.abs(action.seconds) + " 秒";
             } else if ("caption_previous".equals(action.kind)) {
                 description = result.has("fallback") ? "转写文稿未打开，后退 "
@@ -590,12 +702,16 @@ public final class MapperUserService extends IMapperService.Stub {
             } else {
                 description = result.optInt("requestedState") == 3 ? "播放" : "暂停";
             }
+            if (replayRequested) run.loopFeedback = new LoopFeedback(description);
+            else if (wasLooping && !media.isLooping()) run.loopFeedback = new LoopFeedback("已退出循环");
             log(prefix + description);
             Log.i(TAG, "RESULT button=" + button + " " + result);
         } catch (InterruptedException error) {
             throw error;
         } catch (Exception error) {
             log(prefix + errorMessage(error));
+            if (replayRequested) run.loopFeedback = new LoopFeedback(errorMessage(error));
+            else if (wasLooping && !media.isLooping()) run.loopFeedback = new LoopFeedback("已退出循环");
         }
     }
 

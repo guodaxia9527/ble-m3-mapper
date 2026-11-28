@@ -1,42 +1,57 @@
 package com.guodaxia.blem3mapper;
 
 /**
- * Resolves center clicks using input arrival times, independent of slow player/UI actions.
+ * Resolves consecutive clicks using input arrival times, independent of slow player/UI actions.
  * The owner must consume queued input before expiring a single click.
  */
 final class CenterClickTracker<T> {
     static final class Click<T> {
         final T context;
         final boolean doubleClick;
+        final int count;
 
-        Click(T context, boolean doubleClick) {
+        Click(T context, int count) {
             this.context = context;
-            this.doubleClick = doubleClick;
+            this.count = count;
+            this.doubleClick = count == 2;
         }
     }
 
     private final long intervalMs;
+    private final int maxClicks;
     private Object source;
+    private String button;
+    private int count;
     private T pending;
     private long receivedAt;
 
     CenterClickTracker(long intervalMs) {
+        this(intervalMs, 2);
+    }
+
+    CenterClickTracker(long intervalMs, int maxClicks) {
         if (intervalMs < 1) throw new IllegalArgumentException("Click interval must be positive");
         this.intervalMs = intervalMs;
+        this.maxClicks = maxClicks;
     }
 
     boolean hasPending() { return pending != null; }
 
     Click<T> press(Object source, T context, long receivedAt) {
+        return press(source, "", context, receivedAt);
+    }
+
+    Click<T> press(Object source, String button, T context, long receivedAt) {
         if (context == null) throw new IllegalArgumentException("Click context is required");
-        if (pending != null && this.source == source && receivedAt >= this.receivedAt
+        if (pending != null && this.source == source && button.equals(this.button) && receivedAt >= this.receivedAt
                 && receivedAt - this.receivedAt <= intervalMs) {
-            Click<T> result = new Click<>(pending, true);
-            cancel();
-            return result;
+            this.receivedAt = receivedAt;
+            return ++count == maxClicks ? takeSingle() : null;
         }
         Click<T> previous = takeSingle();
         this.source = source;
+        this.button = button;
+        this.count = 1;
         this.pending = context;
         this.receivedAt = receivedAt;
         return previous;
@@ -56,7 +71,7 @@ final class CenterClickTracker<T> {
 
     Click<T> takeSingle() {
         if (pending == null) return null;
-        Click<T> result = new Click<>(pending, false);
+        Click<T> result = new Click<>(pending, count);
         cancel();
         return result;
     }
@@ -64,5 +79,9 @@ final class CenterClickTracker<T> {
     void cancel() {
         source = null;
         pending = null;
+    }
+
+    void cancelSource(Object source) {
+        if (this.source == source) cancel();
     }
 }

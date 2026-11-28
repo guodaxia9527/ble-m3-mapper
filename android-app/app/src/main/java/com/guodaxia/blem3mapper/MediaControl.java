@@ -2,17 +2,20 @@ package com.guodaxia.blem3mapper;
 
 import android.annotation.SuppressLint;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.app.UiAutomation;
 import android.content.Context;
 import android.graphics.Rect;
 import android.media.MediaMetadata;
 import android.media.Rating;
 import android.media.session.MediaController;
+import android.media.session.MediaSession;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
 import android.os.Looper;
 import android.os.HandlerThread;
 import android.os.SystemClock;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityWindowInfo;
 
 import org.json.JSONObject;
@@ -36,10 +39,28 @@ final class MediaControl {
     private Method getAutomationWindows;
     private Method clearAutomationCache;
     private Method disconnectAutomation;
+    private volatile long lastTranscriptScroll = -1000;
+    private MediaSession.Token videoSession;
+    private String videoIdentity;
+    private PlaybackState previousPlayback;
+    private boolean jumpedByRemote;
+    private long segmentStart = -1;
+    private long segmentEnd = -1;
+    private long playingFrom = -1;
+    private long replayUntil = -1;
+    private long replayFrom;
+    private long replayStarted;
+    private boolean replayWasPlaying;
 
     private static final class TranscriptRow {
         final long timeMs;
-        TranscriptRow(long timeMs) { this.timeMs = timeMs; }
+        final Rect bounds;
+        final boolean selected;
+        TranscriptRow(long timeMs, Rect bounds, boolean selected) {
+            this.timeMs = timeMs;
+            this.bounds = bounds;
+            this.selected = selected;
+        }
     }
 
     private static final class SeekOutcome {
@@ -97,8 +118,15 @@ final class MediaControl {
                     uiAutomationClass.getMethod("getServiceInfo").invoke(instance);
             serviceInfo.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                     | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+            serviceInfo.eventTypes |= AccessibilityEvent.TYPE_VIEW_SCROLLED;
             uiAutomationClass.getMethod("setServiceInfo", AccessibilityServiceInfo.class)
                     .invoke(instance, serviceInfo);
+            ((UiAutomation) instance).setOnAccessibilityEventListener(event -> {
+                if (event.getEventType() == AccessibilityEvent.TYPE_VIEW_SCROLLED
+                        && event.getPackageName() != null && YOUTUBE.contentEquals(event.getPackageName())) {
+                    lastTranscriptScroll = SystemClock.elapsedRealtime();
+                }
+            });
             automationLooper = thread;
             automation = instance;
             getAutomationRoot = uiAutomationClass.getMethod("getRootInActiveWindow");
@@ -179,17 +207,204 @@ final class MediaControl {
         return Math.max(0, position);
     }
 
+    void clearPlaybackHistory() {
+        videoSession = null;
+        videoIdentity = null;
+        previousPlayback = null;
+        jumpedByRemote = false;
+        playingFrom = -1;
+        segmentStart = -1;
+        segmentEnd = -1;
+        replayUntil = -1;
+    }
+
+    private static String videoIdentity(MediaController controller) {
+        MediaMetadata metadata = controller.getMetadata();
+        if (metadata == null) return null;
+        String id = metadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
+        if (id != null && !id.isEmpty()) return "id:" + id;
+        String title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
+        long length = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
+        return title == null || title.isEmpty() || length <= 0 ? null : "title:" + title + "\n" + length;
+    }
+
+    boolean observeYoutubePlayback() {
+        try {
+            MediaController controller = controller(YOUTUBE);
+            return observePlayback(controller, controller.getPlaybackState());
+        } catch (RuntimeException error) {
+            clearPlaybackHistory();
+            return false;
+        }
+    }
+
+    private boolean observePlayback(MediaController controller, PlaybackState state) {
+        String identity = videoIdentity(controller);
+        if (identity == null || state == null || state.getPosition() < 0) {
+            clearPlaybackHistory();
+            return false;
+        }
+        if (!controller.getSessionToken().equals(videoSession) || !identity.equals(videoIdentity)) {
+            clearPlaybackHistory();
+            videoSession = controller.getSessionToken();
+            videoIdentity = identity;
+        }
+        PlaybackState previous = previousPlayback;
+        previousPlayback = state;
+        boolean playing = state.getState() == PlaybackState.STATE_PLAYING;
+        if (replayUntil >= 0) {
+            if (playing) replayWasPlaying = true;
+            if (replayWasPlaying && playing && jumped(previous, state)) {
+                invalidateSegment();
+            } else if (playing && position(state) >= replayUntil) {
+                return true;
+            } else if ((state.getState() == PlaybackState.STATE_PAUSED && replayWasPlaying)
+                    || (state.getState() == PlaybackState.STATE_STOPPED)
+                    || (!replayWasPlaying && SystemClock.elapsedRealtime() - replayStarted > 3000)) {
+                replayUntil = -1;
+            }
+            return false;
+        }
+        if (!jumpedByRemote) return false;
+        if (jumped(previous, state) || (previous != null
+                && previous.getState() == PlaybackState.STATE_PAUSED
+                && Math.abs(previous.getPosition() - state.getPosition()) > 1500)) {
+            invalidateSegment();
+            return false;
+        }
+        if (playing) {
+            if (playingFrom < 0) {
+                playingFrom = previous != null && previous.getState() == PlaybackState.STATE_PAUSED
+                        ? previous.getPosition() : state.getPosition();
+            }
+        } else if (state.getState() == PlaybackState.STATE_PAUSED) {
+            if (playingFrom >= 0 && state.getPosition() - playingFrom >= 500) {
+                segmentStart = playingFrom;
+                segmentEnd = state.getPosition();
+            } else if (playingFrom >= 0) {
+                segmentStart = -1;
+                segmentEnd = -1;
+            }
+            playingFrom = -1;
+        } else if (state.getState() == PlaybackState.STATE_STOPPED) {
+            invalidateSegment();
+        } else if (state.getState() != PlaybackState.STATE_BUFFERING) {
+            playingFrom = -1;
+        }
+        return false;
+    }
+
+    private void invalidateSegment() {
+        jumpedByRemote = false;
+        playingFrom = -1;
+        segmentStart = -1;
+        segmentEnd = -1;
+        replayUntil = -1;
+    }
+
+    private static boolean jumped(PlaybackState previous, PlaybackState current) {
+        if (previous == null || previous.getState() != PlaybackState.STATE_PLAYING
+                || previous.getLastPositionUpdateTime() <= 0) return false;
+        long elapsed = current.getLastPositionUpdateTime() - previous.getLastPositionUpdateTime();
+        long expected = previous.getPosition() + (long) (Math.max(0, elapsed) * previous.getPlaybackSpeed());
+        return Math.abs(current.getPosition() - expected) > 1500;
+    }
+
+    boolean isLooping() { return replayUntil >= 0; }
+
+    void repeatSegment() throws Exception {
+        if (replayUntil < 0) return;
+        MediaController controller = controller(YOUTUBE);
+        PlaybackState state = controller.getPlaybackState();
+        if (!observePlayback(controller, state)) return;
+        SeekOutcome outcome = seekAndConfirm(controller, replayFrom, position(state), 300);
+        MediaController active = controller(YOUTUBE);
+        PlaybackState current = active.getPlaybackState();
+        if (!outcome.confirmed || !isSameVideo(active) || current == null
+                || current.getState() == PlaybackState.STATE_PAUSED
+                || current.getState() == PlaybackState.STATE_STOPPED) {
+            replayUntil = -1;
+            if (!outcome.confirmed) throw new IllegalStateException("播放器没有确认回到循环起点");
+            return;
+        }
+        previousPlayback = current;
+    }
+
+    private JSONObject replay(MediaController controller, PlaybackState state, JSONObject result,
+                              boolean loopTranscriptLine) throws Exception {
+        if (state.getState() != PlaybackState.STATE_PAUSED)
+            return result.put("message", "暂停后再双击重播");
+        if (!isSameVideo(controller))
+            return result.put("message", "无法确认当前视频，暂时不能循环");
+        long start = segmentStart;
+        long end = segmentEnd;
+        boolean sentence = false;
+        if (loopTranscriptLine) {
+            ensureTranscriptAutomation();
+            if (isTranscriptPanelOpen()) {
+                long[] range = visibleSentenceRange(position(state));
+                if (range == null)
+                    return result.put("message", "请让当前句和下一句出现在文稿列表中，再双击中键");
+                start = range[0];
+                end = range[1];
+                sentence = true;
+            }
+        }
+        if (!sentence && (!jumpedByRemote || start < 0))
+            return result.put("message", "请先用遥控器跳转，播放一段再暂停");
+        if ((state.getActions() & (PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PLAY_PAUSE)) == 0)
+            throw new IllegalStateException("播放器当前不支持继续播放");
+        PlaybackState beforeSeek = controller.getPlaybackState();
+        if (!isSameVideo(controller) || beforeSeek == null
+                || beforeSeek.getState() != PlaybackState.STATE_PAUSED)
+            return result.put("message", "播放状态已改变，请暂停后重试");
+        SeekOutcome outcome = seekAndConfirm(controller, start, position(beforeSeek), 300);
+        MediaController active = controller(YOUTUBE);
+        PlaybackState current = active.getPlaybackState();
+        if (!outcome.confirmed || !isSameVideo(active) || current == null
+                || current.getState() != PlaybackState.STATE_PAUSED) {
+            throw new IllegalStateException("无法确认重播起点，保持当前播放状态");
+        }
+        replayUntil = end;
+        replayFrom = start;
+        replayStarted = SystemClock.elapsedRealtime();
+        replayWasPlaying = false;
+        previousPlayback = current;
+        playingFrom = -1;
+        controller.getTransportControls().play();
+        return result.put("replayStart", start).put("replayEnd", end).put("sentenceLoop", sentence);
+    }
+
     JSONObject perform(String packageName, ProfileConfig.Action action) throws Exception {
+        return perform(packageName, action, false);
+    }
+
+    JSONObject perform(String packageName, ProfileConfig.Action action, boolean loopTranscriptLine) throws Exception {
         if ("like".equals(action.kind) && !"com.google.android.youtube".equals(packageName))
             throw new IllegalStateException("点赞目前仅支持 YouTube，此应用尚未适配");
         MediaController controller = controller(packageName);
         PlaybackState state = controller.getPlaybackState();
         if (state == null) throw new IllegalStateException("播放器没有提供播放状态");
+        JSONObject result = new JSONObject().put("package", packageName)
+                .put("action", action.kind).put("stateBefore", state.getState());
+        if (YOUTUBE.equals(packageName)) {
+            observePlayback(controller, state);
+            if ("replay".equals(action.kind)) return replay(controller, state, result, loopTranscriptLine);
+            if ("toggle".equals(action.kind) && replayUntil >= 0) {
+                replayUntil = -1;
+            }
+            if ("seek_start".equals(action.kind) || "seek_end".equals(action.kind)) {
+                if (state.getState() != PlaybackState.STATE_PAUSED)
+                    return result.put("message", "暂停后再三击跳到首尾");
+                long length = duration(controller);
+                if ("seek_end".equals(action.kind) && length <= 0)
+                    throw new IllegalStateException("播放器未提供视频时长");
+                return seekTo(controller, state, "seek_start".equals(action.kind) ? 0 : Math.max(0, length - 1500), result);
+            }
+        }
         if (state.getState() != PlaybackState.STATE_PAUSED && state.getState() != PlaybackState.STATE_PLAYING
                 && state.getState() != PlaybackState.STATE_STOPPED)
             throw new IllegalStateException("播放器当前状态暂不支持此操作（状态码 " + state.getState() + "）");
-        JSONObject result = new JSONObject().put("package", packageName)
-                .put("action", action.kind).put("stateBefore", state.getState());
         if ("like".equals(action.kind)) {
             return like(controller, state, result);
         } else if ("caption_previous".equals(action.kind) || "caption_next".equals(action.kind)) {
@@ -246,10 +461,40 @@ final class MediaControl {
         long target = Math.max(0, current + seconds * 1000L);
         long duration = duration(controller);
         if (duration > 0) target = Math.min(duration, target);
-        SeekOutcome outcome = seekAndConfirm(controller, target, current);
-        result.put("seconds", seconds).put("positionBefore", current).put("target", target)
+        return seekTo(controller, state, target, result.put("seconds", seconds));
+    }
+
+    private JSONObject seekTo(MediaController controller, PlaybackState state, long target, JSONObject result)
+            throws Exception {
+        long current = position(state);
+        SeekOutcome outcome = seekFromRemote(controller, target, current);
+        result.put("positionBefore", current).put("target", target)
                 .put("observedPosition", outcome.observedPosition).put("confirmed", outcome.confirmed);
         return result;
+    }
+
+    private boolean isSameVideo(MediaController controller) {
+        return controller.getSessionToken().equals(videoSession)
+                && videoIdentity != null && videoIdentity.equals(videoIdentity(controller));
+    }
+
+    private SeekOutcome seekFromRemote(MediaController controller, long target, long current)
+            throws Exception {
+        boolean youtube = YOUTUBE.equals(controller.getPackageName());
+        if (youtube) {
+            invalidateSegment();
+            previousPlayback = null;
+        }
+        SeekOutcome outcome = seekAndConfirm(controller, target, current);
+        if (youtube && outcome.confirmed && target != current && isSameVideo(controller)) {
+            PlaybackState postSeek = controller.getPlaybackState();
+            if (postSeek != null && postSeek.getPosition() >= 0) {
+                jumpedByRemote = true;
+                previousPlayback = postSeek;
+                if (postSeek.getState() == PlaybackState.STATE_PLAYING) playingFrom = target;
+            }
+        }
+        return outcome;
     }
 
     private interface NodeMatch { boolean matches(AccessibilityNodeInfo node); }
@@ -436,7 +681,7 @@ final class MediaControl {
         TranscriptRow target = null;
         List<TranscriptRow> rows = new ArrayList<>();
         for (int attempt = 0; attempt < 6; attempt++) {
-            rows = readTranscriptRows();
+            rows = readTranscriptRows(false);
             if (rows.isEmpty()) throw new IllegalStateException("文稿尚未载入字幕行，请稍后再试");
             long first = rows.get(0).timeMs;
             long last = rows.get(rows.size() - 1).timeMs;
@@ -457,7 +702,7 @@ final class MediaControl {
         long lookupFinished = SystemClock.elapsedRealtime();
         // The timestamp is the meaningful target. A media seek cannot accidentally focus
         // the search box when YouTube scrolls or changes the row's screen coordinates.
-        SeekOutcome outcome = seekAndConfirm(controller, target.timeMs, current);
+        SeekOutcome outcome = seekFromRemote(controller, target.timeMs, current);
         result.put("targetPosition", target.timeMs).put("observedPosition", outcome.observedPosition)
                 .put("confirmed", outcome.confirmed).put("lookupMs", lookupFinished - actionStarted)
                 .put("seekAndConfirmMs", SystemClock.elapsedRealtime() - lookupFinished)
@@ -481,6 +726,19 @@ final class MediaControl {
         return target;
     }
 
+    private long[] visibleSentenceRange(long positionMs) throws Exception {
+        List<TranscriptRow> rows = readTranscriptRows(true);
+        for (int i = 1; i < rows.size(); i++) {
+            TranscriptRow current = rows.get(i - 1);
+            TranscriptRow next = rows.get(i);
+            if (current.timeMs <= positionMs && positionMs < next.timeMs
+                    && current.bounds != null && next.bounds != null) {
+                return new long[]{current.timeMs, next.timeMs};
+            }
+        }
+        return null;
+    }
+
     private static String transcriptTimes(List<TranscriptRow> rows) {
         StringBuilder times = new StringBuilder();
         for (TranscriptRow row : rows) {
@@ -491,6 +749,11 @@ final class MediaControl {
     }
 
     private SeekOutcome seekAndConfirm(MediaController controller, long target, long current)
+            throws Exception {
+        return seekAndConfirm(controller, target, current, 1200);
+    }
+
+    private SeekOutcome seekAndConfirm(MediaController controller, long target, long current, long tolerance)
             throws Exception {
         PlaybackState before = controller.getPlaybackState();
         if (before == null || (before.getActions() & PlaybackState.ACTION_SEEK_TO) == 0)
@@ -509,7 +772,7 @@ final class MediaControl {
             long expected = target + (playing ? (long) (elapsed * before.getPlaybackSpeed()) : 0);
             boolean moved = Math.abs(beforePosition - target) < 500
                     || state.getLastPositionUpdateTime() != before.getLastPositionUpdateTime();
-            if (moved && Math.abs(observed - expected) <= 1200) return new SeekOutcome(observed, true);
+            if (moved && Math.abs(observed - expected) <= tolerance) return new SeekOutcome(observed, true);
         }
         return new SeekOutcome(observed, false);
     }
@@ -543,10 +806,38 @@ final class MediaControl {
         return shown;
     }
 
-    private List<TranscriptRow> readTranscriptRows() throws Exception {
+    Rect currentTranscriptBounds() throws Exception {
+        if (transcriptIsScrolling()) return null;
+        if (!isTranscriptAutomationReady() || !isTranscriptPanelOpen() || isInputMethodVisible()) return null;
+        MediaController player = controller(YOUTUBE);
+        PlaybackState state = player.getPlaybackState();
+        if (state == null || state.getPosition() < 0) return null;
+        int playback = state.getState();
+        if (playback != PlaybackState.STATE_PLAYING && playback != PlaybackState.STATE_PAUSED
+                && playback != PlaybackState.STATE_BUFFERING) return null;
+        long positionMs = position(state);
+        List<TranscriptRow> rows = readTranscriptRows(true);
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            TranscriptRow row = rows.get(i);
+            if (row.timeMs > positionMs) continue;
+            // A scrolled list may end before the active cue. Only mark its last row
+            // when YouTube identifies it or the player is at that row's timestamp.
+            if (i == rows.size() - 1 && !row.selected && positionMs - row.timeMs >= 1000) return null;
+            return transcriptIsScrolling() ? null : row.bounds;
+        }
+        return null;
+    }
+
+    private boolean transcriptIsScrolling() {
+        return SystemClock.elapsedRealtime() - lastTranscriptScroll < 300;
+    }
+
+    private List<TranscriptRow> readTranscriptRows(boolean includeBounds) throws Exception {
         AccessibilityNodeInfo root = nodeById("results");
         if (root == null) throw new IllegalStateException("无法读取 YouTube 文稿列表");
         Map<Long, TranscriptRow> unique = new LinkedHashMap<>();
+        Rect viewport = new Rect();
+        if (includeBounds) root.getBoundsInScreen(viewport);
         ArrayDeque<AccessibilityNodeInfo> pending = new ArrayDeque<>();
         pending.add(root);
         try {
@@ -559,7 +850,15 @@ final class MediaControl {
                     // YouTube exposes each cue as a full accessibility description. Do not
                     // interpret arbitrary caption sentence text as a separate timestamp.
                     if (timeMs >= 0) {
-                        unique.put(timeMs, new TranscriptRow(timeMs));
+                        Rect bounds = null;
+                        if (includeBounds && node.isVisibleToUser()) {
+                            bounds = new Rect();
+                            node.getBoundsInScreen(bounds);
+                            if (!bounds.intersect(viewport)) bounds = null;
+                        }
+                        TranscriptRow previous = unique.get(timeMs);
+                        if (previous == null || previous.bounds == null || node.isSelected())
+                            unique.put(timeMs, new TranscriptRow(timeMs, bounds, includeBounds && node.isSelected()));
                     }
                     for (int i = 0; i < node.getChildCount(); i++) {
                         AccessibilityNodeInfo child = node.getChild(i);
